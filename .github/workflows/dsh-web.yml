@@ -47,6 +47,7 @@ env:
   SESSION_ARCHIVE_MIN_AGE_SEC: ${{ vars.SESSION_ARCHIVE_MIN_AGE_SEC || '60' }}
   DSH_MIN_FREE_MB: ${{ vars.DSH_MIN_FREE_MB || '5120' }}
   DSH_TEMP_WARN_MB: ${{ vars.DSH_TEMP_WARN_MB || '8192' }}
+  DSH_DEBUG_LOG_TAIL: ${{ vars.DSH_DEBUG_LOG_TAIL || 'false' }}
   DSH_MAX_RUNTIME_MIN: ${{ inputs.max_runtime_minutes }}
   DSH_CHECKPOINT_MIN: ${{ inputs.checkpoint_minutes }}
   DSH_AUTO_RESTART: ${{ inputs.auto_restart }}

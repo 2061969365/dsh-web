@@ -85,6 +85,7 @@ DSH_PID=""
 CFD_PID=""
 ARCHIVE_PID=""
 ARCHIVE_READY=false
+ARCHIVE_OVERLAY=""
 DSH_URL=""
 
 CHECKPOINT_EVERY_MIN="$CHECKPOINT_BASE_MIN"
@@ -266,6 +267,13 @@ publish_url() {
   return 0
 }
 
+dump_dsh_log_tail() {
+  [ "${DSH_DEBUG_LOG_TAIL:-false}" = true ] || return 0
+  [ -f "$DSH_LOG" ] || return 0
+  warn "dsh log tail (URL redacted):"
+  sed -E 's#(dsh web: https?://)[^[:space:]]+#\1<redacted>#g' "$DSH_LOG" 2>/dev/null | tail -n 80 >&2 || true
+}
+
 wait_for_url() {
   local waited=0 line url rc=0
   while (( waited < URL_TIMEOUT_SEC )); do
@@ -274,6 +282,7 @@ wait_for_url() {
       wait "$DSH_PID" 2>/dev/null || rc=$?
       DSH_PID=""
       warn "dsh exited before printing its URL line (rc=$rc); see $DSH_LOG"
+      dump_dsh_log_tail
       return 1
     fi
     line="$(grep -m1 -E '^dsh web: https?://' "$DSH_LOG" 2>/dev/null || true)"
@@ -346,31 +355,33 @@ ensure_session_archive_plugin() {
   local pkg="$DSH_HOME/profiles/web/package.json"
   local plugin_dir="$REPO_ROOT/dsh-session-archive"
   local plugin_name='@dsh-web/session-archive'
-  local overlay="$REPO_ROOT/dsh-session-archive.overlay.yml"
-  [ -f "$overlay" ] || { warn "session archive overlay not found"; return 0; }
+  local overlay_src="$REPO_ROOT/dsh-session-archive.overlay.yml"
+  local overlay="$DSH_HOME/profiles/web/session-archive.overlay.yml"
+  [ -f "$overlay_src" ] || { warn "session archive overlay not found"; return 0; }
   [ -d "$plugin_dir" ] || { warn "session archive plugin source not found"; return 0; }
   [ -f "$pkg" ] || { warn "profile package.json not found; session archive plugin not installed"; return 0; }
   command -v jq >/dev/null 2>&1 || { warn "jq is not available; cannot inspect the profile"; return 0; }
-  if jq -e --arg name "$plugin_name" '.dependencies[$name] // empty' "$pkg" >/dev/null 2>&1; then
-    if [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
-      ARCHIVE_READY=true
+  if ! jq -e --arg name "$plugin_name" '.dependencies[$name] // empty' "$pkg" >/dev/null 2>&1; then
+    if ! command -v pnpm >/dev/null 2>&1; then
+      warn "pnpm is not installed; cannot add the session archive plugin"
+      return 0
     fi
-    return 0
-  fi
-  if ! command -v pnpm >/dev/null 2>&1; then
-    warn "pnpm is not installed; cannot add the session archive plugin"
-    return 0
-  fi
-  log "adding the session archive plugin to profile web"
-  if env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
-         -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK -u SESSION_ARCHIVE_TOKEN \
-         timeout 300 dsh plugin --profile web add "file:$plugin_dir" >>"$DSH_LOG" 2>&1; then
-    log "session archive plugin added to profile web"
-    if [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
-      ARCHIVE_READY=true
+    log "adding the session archive plugin to profile web"
+    if env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+           -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK -u SESSION_ARCHIVE_TOKEN \
+           timeout 300 dsh plugin --profile web add "file:$plugin_dir" >>"$DSH_LOG" 2>&1; then
+      log "session archive plugin added to profile web"
+    else
+      warn "could not add the session archive plugin; cold sessions will not auto-restore"
+      return 0
     fi
+  fi
+  [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ] || return 0
+  if install -m 600 -- "$overlay_src" "$overlay" 2>/dev/null; then
+    ARCHIVE_OVERLAY="$overlay"
+    ARCHIVE_READY=true
   else
-    warn "could not add the session archive plugin; cold sessions will not auto-restore"
+    warn "cannot install the session archive overlay beside the profile"
   fi
 }
 
@@ -412,8 +423,8 @@ stop_session_archive() {
 
 start_dsh() {
   local -a patch_args=()
-  if [ "$ARCHIVE_READY" = true ]; then
-    patch_args=(--patch "$REPO_ROOT/dsh-session-archive.overlay.yml")
+  if [ "$ARCHIVE_READY" = true ] && [ -n "$ARCHIVE_OVERLAY" ] && [ -f "$ARCHIVE_OVERLAY" ]; then
+    patch_args=(--patch "$ARCHIVE_OVERLAY")
   else
     warn "session archive plugin is not ready; starting without the overlay"
   fi
@@ -715,7 +726,7 @@ main() {
   prune_stale_tmp
   ensure_session_archive_plugin
   restore_profile_plugins
-  if [ "$ARCHIVE_READY" != true ]; then
+  if [ "$ARCHIVE_READY" != true ] || [ -z "$ARCHIVE_OVERLAY" ] || [ ! -f "$ARCHIVE_OVERLAY" ]; then
     export SESSION_ARCHIVE_ENABLED=false
     warn "session archiving is disabled for this run because the plugin is not ready"
   fi
