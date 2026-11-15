@@ -26,7 +26,7 @@
 | 变量 | 值 | 用途 |
 | --- | --- | --- |
 | `DSH_HOME` | `/home/runner/dsh-home` | dsh 配置、会话、附件、skills |
-| `DSH_WORKSPACE` | `/home/runner/dsh-work` | 工作区 |
+| `DSH_WORKSPACE` | `/home/runner/work1` | 工作区 |
 | `DSH_SCRATCH` | 自动选择 | 最大可写挂载点，优先 `/mnt`（必要时 `/mnt/dsh-scratch`） |
 | `TMPDIR`/`TMP`/`TEMP` | `$DSH_SCRATCH/dsh-tmp` | 临时文件 |
 | `STATE_CLONE` | `$DSH_SCRATCH/dsh-state` | 私有状态仓库临时克隆 |
@@ -52,7 +52,7 @@ workflow 和脚本之间共享的变量：
 | 变量 | 默认 | 消费方 | 说明 |
 | --- | --- | --- | --- |
 | `DSH_HOME` | `/home/runner/dsh-home` | 两者 | 快照源/恢复目标 |
-| `DSH_WORKSPACE` | `/home/runner/dsh-work` | 两者 | 快照源/恢复目标 |
+| `DSH_WORKSPACE` | `/home/runner/work1` | 两者 | 快照源/恢复目标 |
 | `DSH_SCRATCH` | 自动选择 | 两者 | 临时/状态/日志的根挂载点 |
 | `STATE_REPO` | 无（必填 variable） | `state.sh`、`dsh-stop` | 私有状态仓库 |
 | `STATE_REPO_TOKEN` | 无（secret） | `state.sh`、`dsh-stop` | 状态仓库 PAT，不得打印 |

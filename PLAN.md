@@ -10,7 +10,7 @@ No R2/S3. State snapshots live as **private release assets** in the state repo; 
 ## Paths on the runner
 
 - `DSH_HOME=/home/runner/dsh-home`
-- `DSH_WORKSPACE=/home/runner/dsh-work`
+- `DSH_WORKSPACE=/home/runner/work1`
 - `DSH_SCRATCH` = largest writable mount with >=20GB free and >=5% free inodes (`/mnt` if available, else `/home/runner`; fail unless `DSH_ALLOW_SMALL_SCRATCH=true`)
 - `TMPDIR/TMP/TEMP=$DSH_SCRATCH/dsh-tmp`
 - `STATE_CLONE=$DSH_SCRATCH/dsh-state`

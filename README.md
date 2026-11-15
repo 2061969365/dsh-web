@@ -312,13 +312,15 @@ gh workflow run dsh-stop.yml --repo "$REPO"
 | 路径/变量 | 值 | 说明 |
 | --- | --- | --- |
 | `DSH_HOME` | `/home/runner/dsh-home` | dsh 配置、会话、附件、skills |
-| `DSH_WORKSPACE` | `/home/runner/dsh-work` | 工作区源码 |
+| `DSH_WORKSPACE` | `/home/runner/work1` | 工作区源码（DSH 默认工作区） |
 | `DSH_SCRATCH` | 自动选择 | 优先 `/mnt`（必要时 `/mnt/dsh-scratch`），需 ≥20GB 且 inode ≥5%；否则 `/home/runner` |
 | `TMPDIR` / `TMP` / `TEMP` | `$DSH_SCRATCH/dsh-tmp` | 所有临时文件 |
 | `STATE_CLONE` | `$DSH_SCRATCH/dsh-state` | 私有状态仓库的临时克隆 |
 | `RUN_DIR` | `$DSH_SCRATCH/run` | 日志、`url.txt`、`meta.json`、打包 staging |
 
 scratch 选择会实测候选挂载点的可用空间和 inode。若 `/mnt` 不满足条件而 `/home/runner` 也不够 20GB，工作流默认失败；只有设置仓库变量 `DSH_ALLOW_SMALL_SCRATCH=true` 才会在小于 20GB 的磁盘上继续（不推荐，5GB 状态很容易把根盘写满）。
+
+DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工作区时请把路径选在 `/home/runner/work1` 或它的子目录下；选择 `/home/runner` 下的其他路径（例如另一个 `work2`）在重启后不会恢复。
 
 ### 磁盘保护
 

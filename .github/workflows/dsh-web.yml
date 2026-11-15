@@ -30,7 +30,7 @@ permissions:
 
 env:
   DSH_HOME: /home/runner/dsh-home
-  DSH_WORKSPACE: /home/runner/dsh-work
+  DSH_WORKSPACE: /home/runner/work1
   DSH_PUBLIC_HOST: ${{ vars.DSH_PUBLIC_HOST }}
   DSH_VERSION: ${{ vars.DSH_VERSION }}
   STATE_REPO: ${{ vars.STATE_REPO }}
