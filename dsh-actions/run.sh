@@ -356,7 +356,6 @@ ensure_session_archive_plugin() {
   local plugin_dir="$REPO_ROOT/dsh-session-archive"
   local plugin_name='@dsh-web/session-archive'
   local overlay_src="$REPO_ROOT/dsh-session-archive.overlay.yml"
-  local overlay="$DSH_HOME/profiles/web/session-archive.overlay.yml"
   [ -f "$overlay_src" ] || { warn "session archive overlay not found"; return 0; }
   [ -d "$plugin_dir" ] || { warn "session archive plugin source not found"; return 0; }
   [ -f "$pkg" ] || { warn "profile package.json not found; session archive plugin not installed"; return 0; }
@@ -377,7 +376,15 @@ ensure_session_archive_plugin() {
     fi
   fi
   [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ] || return 0
-  if install -m 600 -- "$overlay_src" "$overlay" 2>/dev/null; then
+  ARCHIVE_READY=true
+}
+
+install_session_archive_overlay() {
+  local source="$REPO_ROOT/dsh-session-archive.overlay.yml"
+  local overlay="$DSH_HOME/profiles/web/session-archive.overlay.yml"
+  [ -f "$source" ] || { warn "session archive overlay not found"; return 0; }
+  [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ] || return 0
+  if install -m 600 -- "$source" "$overlay" 2>>"$DSH_LOG"; then
     ARCHIVE_OVERLAY="$overlay"
     ARCHIVE_READY=true
   else
@@ -726,6 +733,7 @@ main() {
   prune_stale_tmp
   ensure_session_archive_plugin
   restore_profile_plugins
+  install_session_archive_overlay
   if [ "$ARCHIVE_READY" != true ] || [ -z "$ARCHIVE_OVERLAY" ] || [ ! -f "$ARCHIVE_OVERLAY" ]; then
     export SESSION_ARCHIVE_ENABLED=false
     warn "session archiving is disabled for this run because the plugin is not ready"
