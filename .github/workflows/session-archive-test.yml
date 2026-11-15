@@ -19,3 +19,5 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd jq
       - name: Run archive tests
         run: bash dsh-actions/tests/session-archive-test.sh
+      - name: Run agent tests
+        run: node dsh-actions/tests/session-archive-agent-test.mjs
