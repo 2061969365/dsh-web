@@ -429,22 +429,22 @@ stop_session_archive() {
 }
 
 start_dsh() {
-  local -a patch_args=()
+  local -a dsh_args=(dsh)
   if [ "$ARCHIVE_READY" = true ] && [ -n "$ARCHIVE_OVERLAY" ] && [ -f "$ARCHIVE_OVERLAY" ]; then
-    patch_args=(--patch "$ARCHIVE_OVERLAY")
+    dsh_args+=(--patch "$ARCHIVE_OVERLAY")
   else
     warn "session archive plugin is not ready; starting without the overlay"
   fi
+  dsh_args+=(--profile web --host 127.0.0.1 --port 3080 --no-open
+    --public-url "https://$DSH_PUBLIC_HOST/"
+    --trusted-host "$DSH_PUBLIC_HOST")
   log "starting dsh web"
   (
     cd -- "$DSH_WORKSPACE"
     exec env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN -u DSH_NOTIFY_WEBHOOK \
       -u SESSION_ARCHIVE_TOKEN \
       DSH_SESSION_ARCHIVE_SOCKET="$ARCHIVE_SOCKET" \
-      dsh web --host 127.0.0.1 --port 3080 --no-open \
-        --public-url "https://$DSH_PUBLIC_HOST/" \
-        --trusted-host "$DSH_PUBLIC_HOST" \
-        "${patch_args[@]}"
+      "${dsh_args[@]}"
   ) >>"$DSH_LOG" 2>&1 &
   DSH_PID=$!
 }
