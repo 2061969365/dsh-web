@@ -30,7 +30,7 @@
 | `DSH_SCRATCH` | 自动选择 | 最大可写挂载点，优先 `/mnt`（必要时 `/mnt/dsh-scratch`） |
 | `TMPDIR`/`TMP`/`TEMP` | `$DSH_SCRATCH/dsh-tmp` | 临时文件 |
 | `STATE_CLONE` | `$DSH_SCRATCH/dsh-state` | 私有状态仓库临时克隆 |
-| `RUN_DIR` | `$DSH_SCRATCH/run` | 日志、`url.txt`、`meta.json`、staging |
+| `RUN_DIR` | `$DSH_SCRATCH/run` | 日志、`url.txt`、打包 staging |
 
 scratch 选择规则：候选挂载点必须同时满足 **≥20GB 可用空间**和 **≥5% 可用 inode**；优先 `/mnt`，`/mnt` 不可写时尝试 `/mnt/dsh-scratch`，否则 `/home/runner`。都不满足时工作流失败，除非设置仓库变量 `DSH_ALLOW_SMALL_SCRATCH=true`（仅用于调试，5GB 状态可能写满根盘）。
 
@@ -40,7 +40,7 @@ scratch 选择规则：候选挂载点必须同时满足 **≥20GB 可用空间*
 - `cloudflared.log`（0600）：隧道日志。
 - `state.log`（0600）：所有 `state.sh` 调用的输出。
 - `auto-restart.log`（0600）：自动重启 dispatch 的输出。
-- `git.log`、`restore.log`、`release.log`、`gitleaks.log`（0600）：clone/push、恢复、release 和扫描的诊断日志。
+- `dsh-web.log`、`cloudflared.log`、`state.log`、`auto-restart.log`（0600）：dsh/cloudflared 输出、状态脚本和自动重启诊断日志。
 - `url.txt`（0600）：解析出的完整访问 URL。
 - `meta.json`：若存在，`publish-url` 会同步到控制分支；常规情况下由 `save` 更新控制分支的 meta。
 - `state/`：`rsync` staging 和打包临时目录。
@@ -121,7 +121,7 @@ state.sh status               # 输出紧凑 JSON（不含 URL/token）
 ```text
 runtime/url.txt          当前完整访问 URL（0600，含访问令牌）
 runtime/meta.json        最近一次 save 的 raw_bytes/raw_mb/parts/scratch_free_mb/final
-runtime/lock.json        run_id、host、started_epoch、heartbeat_epoch、updated
+runtime/lock.json        run_id、host、started、heartbeat（ISO 8601）
 runtime/state.json       当前快照：run_id、created、raw_bytes/raw_mb、home/work parts
 runtime/state.prev.json  上一份快照指针
 .gitattributes           * -text；*.zst binary
@@ -152,11 +152,11 @@ work-<run_id>-<ts>.tar.zst.part-NN
 3. 检查 `runtime/lock.json`：其他 run 的心跳在 45 分钟内时以 exit 3 拒绝启动；超过 45 分钟视为陈旧并记录告警后接管。
 4. 读取 `runtime/state.json`，下载精确的 asset 名称/分卷到 staging，逐卷校验 sha256。
 5. `cat parts | tar --zstd -xpf - -C <target>` 恢复到 `DSH_HOME` / `DSH_WORKSPACE`。
-6. 恢复权限（0600/0700）、拒绝绝对/逃逸符号链接，并校验 `storages/workspace.json` 是合法 JSON。
+6. 恢复目录权限 0700，拒绝绝对/逃逸符号链接，并校验 `storages/workspace.json` 是合法 JSON（文件权限沿用归档内容）。
 7. 当前快照不可读时自动回退 `runtime/state.prev.json`。
 8. 有快照但两份都不可读时**中止**；绝不以空状态覆盖已有快照。
 9. 首次运行（没有 `state.json`）才允许空状态启动。
-10. 写入 `runtime/lock.json`（run_id/host/started_epoch/heartbeat_epoch）并用 amend 提交推送。
+10. 写入 `runtime/lock.json`（run_id/host/started/heartbeat）并用 amend 提交推送。
 
 ### 3.5 `save` 流程
 
@@ -175,7 +175,7 @@ work-<run_id>-<ts>.tar.zst.part-NN
 ### 3.6 `publish-url`
 
 - 默认**不带参数**：从 `$RUN_DIR/url.txt` 读取 URL（`run.sh` 已先以 0600 写入），再写入控制分支的 `runtime/url.txt`（0600）。
-- 若 `$RUN_DIR/meta.json` 存在，一并同步到控制分支；否则保留 `save` 写入的 `runtime/meta.json`。
+- `meta.json` 由 `init` / `save` 更新；`publish-url` 不改写它。
 - 可选 `<url>` 参数只用于手动/调试；自动流程不要使用，避免完整 URL（含令牌）进入 argv 和进程列表。
 - 提交并推送 `state` 分支。
 - 不在 stdout、job summary 或公开日志中打印 URL；URL 仅出现在 dsh 进程自身的 0600 日志（本地 scratch，不上传）和私有 `runtime/url.txt` 中；`run.sh` 负责写入文件并只显示掩码版本。
@@ -412,6 +412,6 @@ grep -n 'publish-url' dsh-actions/run.sh dsh-actions/state.sh
 - `run.sh` 实际调用的子命令集合（不重复 init；`publish-url` 不传 URL）。
 - `dsh-stop.yml` 写入的变量位置（私有状态仓库）和清除逻辑。
 - 退出码（2/3/5）与 `run.sh` 的 checkpoint 停止条件一致。
-- 资产命名、锁字段（heartbeat_epoch）与 `state.json` 字段名和恢复代码一致。
+- 资产命名、锁字段（`started`/`heartbeat`）与 `state.json` 字段名和恢复代码一致。
 
 发现差异时改文档或改脚本均可，但必须让**脚本、workflow、两份 README** 在合并前保持一致。

@@ -238,7 +238,7 @@ gh run watch --repo "$REPO" <run-id>
 2. 安装固定版本的 dsh、cloudflared、gitleaks，并校验后两者的 SHA-256。
 3. `state.sh init`：没有快照时从空状态开始；有快照时校验并恢复。
 4. 启动 cloudflared 和 `dsh web`，解析出带令牌的访问 URL。
-5. URL 的持久位置只有私有状态仓库的 `runtime/url.txt`（权限 0600），并发布到 `state` 分支；runner 本地的 `RUN_DIR/url.txt` 是临时文件。
+5. URL 的持久位置只有私有状态仓库的 `runtime/url.txt`（由私有仓库保护；git 只记录 0644，`publish-url` 在本地 clone 中重写为 0600）；runner 本地的 `RUN_DIR/url.txt` 是临时文件。
 6. 之后每 10/20 分钟 checkpoint。
 
 **取 URL**（私有仓库，需已登录且有权限）：

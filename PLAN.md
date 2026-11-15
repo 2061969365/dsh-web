@@ -71,7 +71,7 @@ profile patch/package/pnpm-lock, skills, AGENTS.md, `.anonymous-user-id`, work s
 
 ```
 state.sh init                 # clone control, check private/lock, restore snapshot, chmod, validate, write lock
-state.sh publish-url <url>    # write runtime/url.txt 0600 + meta, commit/push
+state.sh publish-url [url]    # default reads $RUN_DIR/url.txt; write runtime/url.txt 0600 + meta, commit/push
 state.sh save [--final]       # stage/tar/split/upload/pointer/commit/cleanup; exit 2 on budget violation
 state.sh should-stop          # exit 0 if DSH_STOP variable == GITHUB_RUN_ID or "all"
 state.sh release-lock         # remove runtime/lock.json, commit/push
@@ -120,7 +120,7 @@ pinned cloudflared (SHA-256 verified), pinned gitleaks; `state.sh init` (10 min)
 `run.sh` (345 min); summary.
 
 `dsh-stop.yml`: workflow_dispatch; `permissions: actions: write, contents: read`; find the
-in-progress dsh-web run; with `STATE_REPO_TOKEN` set `DSH_STOP` to its run id; wait up to 120s;
+in-progress dsh-web run; with `STATE_REPO_TOKEN` set `DSH_STOP` to its run id; wait up to 540s;
 fallback `gh run cancel`; clear the variable. The supervisor polls it every 10s and exits
 gracefully.
 

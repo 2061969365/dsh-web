@@ -87,6 +87,7 @@ CHECKPOINT_FAILURES=0
 LAST_CHECKPOINT_AT="$STARTED_AT"
 LAST_FREE_MB=""
 LAST_INODE_FREE_PCT=100
+LAST_STOP_WARN_AT=0
 FINAL_SAVE_RC=1
 RELEASE_LOCK_RC=1
 AUTO_RESTART_RC=""
@@ -208,6 +209,15 @@ prune_subprocess_spill() {
   log "pruning dsh-subprocess-* older than ${SUBPROCESS_MAX_AGE_MIN} min"
   find "$TMPDIR" -mindepth 1 -maxdepth 1 -name 'dsh-subprocess-*' \
     -mmin +"$SUBPROCESS_MAX_AGE_MIN" -exec rm -rf -- {} + 2>/dev/null || true
+}
+
+prune_stale_tmp() {
+  [[ -d "$TMPDIR" ]] || return 0
+  find "$TMPDIR" -mindepth 1 -maxdepth 1 \
+    \( -name '*.tmp' -o -name '*.tmpdir' -o -name '.staging-*' \) \
+    -mmin +60 -exec rm -rf -- {} + 2>/dev/null || true
+  find /tmp -mindepth 1 -maxdepth 1 -name 'dsh-ssh-*' -mmin +60 \
+    -exec rm -rf -- {} + 2>/dev/null || true
 }
 
 cleanup_tmp_scratch() {
@@ -375,18 +385,27 @@ checkpoint() {
 }
 
 run_loop() {
-  local now disk_at=0 rc=0
+  local now disk_at=0 rc=0 stop_out="" stop_rc=0
   while true; do
     if (( STOP_REQUESTED == 1 )); then
       STOP_REASON="${STOP_REASON:-signal}"
       EXIT_CODE=0
       return 0
     fi
-    if timeout 20 bash "$STATE_SH" should-stop >/dev/null 2>&1; then
+    if stop_out="$(timeout 20 bash "$STATE_SH" should-stop 2>&1)"; then
       log "stop requested through the state stop variable"
       STOP_REASON="stop-variable"
       EXIT_CODE=0
       return 0
+    else
+      stop_rc=$?
+      if (( stop_rc != 1 )) || [[ -n "$stop_out" ]]; then
+        now=$(date +%s)
+        if (( now - LAST_STOP_WARN_AT >= 300 )); then
+          LAST_STOP_WARN_AT="$now"
+          warn "should-stop failed (rc=$stop_rc): ${stop_out:-no output}"
+        fi
+      fi
     fi
     if ! process_alive "$DSH_PID"; then
       wait "$DSH_PID" 2>/dev/null || rc=$?
@@ -583,6 +602,7 @@ main() {
   export TEMP="${TEMP:-$TMPDIR}"
 
   prune_subprocess_spill
+  prune_stale_tmp
 
   if ! start_cloudflared; then
     STOP_REASON="cloudflared-startup"

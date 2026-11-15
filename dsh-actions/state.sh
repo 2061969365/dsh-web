@@ -924,12 +924,26 @@ cmd_init() {
   if [ "$free" -lt "$STATE_MIN_FREE_MB" ]; then
     die 6 "only ${free}MB free on scratch (< ${STATE_MIN_FREE_MB}MB)"
   fi
+  local need_mb=0 root_free
+  if [ -f "$STATE_FILE" ] && pointer_valid "$STATE_FILE"; then
+    need_mb=$(jq -r '.raw_mb // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+  elif [ -f "$PREV_FILE" ] && pointer_valid "$PREV_FILE"; then
+    need_mb=$(jq -r '.raw_mb // 0' "$PREV_FILE" 2>/dev/null || echo 0)
+  fi
+  case $need_mb in
+    ''|*[!0-9]*) need_mb=0 ;;
+  esac
+  root_free=$(free_mb_of /)
+  if [ "$need_mb" -gt 0 ] && [ "$root_free" -lt $((need_mb + 1024)) ]; then
+    die 6 "only ${root_free}MB free on /, need ~$((need_mb + 1024))MB to restore ${need_mb}MB of state"
+  fi
   restore_state
   chmod 700 -- "$DSH_HOME" "$DSH_WORKSPACE" || die 6 "cannot chmod state directories"
   if [ "$RESTORED_FROM" != none ] && [ "$DSH_PERSIST_CREDENTIALS" != true ] && [ -f "$DSH_HOME/.credentials.yaml" ]; then
     rm -f -- "$DSH_HOME/.credentials.yaml" || die 6 "cannot remove persisted credentials"
     log "removed .credentials.yaml from restored home (default credentials are not persisted)"
   fi
+  rm -f -- "$URL_FILE" || true
   write_lock
   update_meta_init
   commit_control "state: init run $GITHUB_RUN_ID"
@@ -1164,6 +1178,7 @@ cmd_should_stop() {
   local value rc=0
   value=$(gh_state variable get DSH_STOP --repo "$STATE_REPO" --json value --jq '.value' 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
+    warn "cannot read DSH_STOP from $STATE_REPO (gh exit $rc)"
     exit 1
   fi
   value=${value//$'\r'/}
