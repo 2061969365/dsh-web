@@ -23,7 +23,9 @@ const fullLog = path.join(full, 'sessions', 'proj', 's1', 'session.v4.jsonl.zstd
 fs.writeFileSync(fullLog, execFileSync('zstd', ['-q', '-c', fullJsonl]))
 fs.writeFileSync(path.join(full, 'sessions', 'proj', 's1', 'state.json'), '{"title":"archived"}\n')
 fs.writeFileSync(path.join(target, 'state.json'), '{"title":"archived"}\n')
-fs.writeFileSync(path.join(target, 'session.v4.jsonl.zstd'), execFileSync('zstd', ['-q', '-c', '{"type":"session","id":"s1"}\n']))
+const stubJsonl = path.join(root, 'stub.jsonl')
+fs.writeFileSync(stubJsonl, '{"type":"session","id":"s1"}\n')
+fs.writeFileSync(path.join(target, 'session.v4.jsonl.zstd'), execFileSync('zstd', ['-q', '-c', stubJsonl]))
 const fullBytes = fs.statSync(fullLog).size
 
 const asset = `session-s1-${crypto.createHash('sha256').update(fs.readFileSync(fullLog)).digest('hex').slice(0, 16)}.tar.zst`
