@@ -311,6 +311,28 @@ start_cloudflared() {
   return 0
 }
 
+restore_profile_plugins() {
+  local pkg="$DSH_HOME/profiles/web/package.json" deps
+  [ -f "$pkg" ] || return 0
+  if ! command -v pnpm >/dev/null 2>&1; then
+    warn "pnpm is not installed; external profile plugins will be skipped"
+    return 0
+  fi
+  deps=$(jq -r '.dependencies // {} | length' "$pkg" 2>/dev/null || true)
+  case $deps in
+    ''|*[!0-9]*) deps=0 ;;
+  esac
+  (( deps > 0 )) || return 0
+  log "reinstalling ${deps} profile plugin dependencies"
+  if env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+         -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK \
+         timeout 900 dsh plugin --profile web install >>"$DSH_LOG" 2>&1; then
+    log "profile plugins reinstalled"
+  else
+    warn "profile plugin reinstall failed; dsh will start and skip missing bundles"
+  fi
+}
+
 start_dsh() {
   log "starting dsh web"
   (
@@ -603,6 +625,7 @@ main() {
 
   prune_subprocess_spill
   prune_stale_tmp
+  restore_profile_plugins
 
   if ! start_cloudflared; then
     STOP_REASON="cloudflared-startup"

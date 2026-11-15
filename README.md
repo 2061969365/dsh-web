@@ -143,6 +143,8 @@ gh secret set DSH_NOTIFY_WEBHOOK --repo "$REPO" # 可选，预留通知 webhook
 gh variable set STATE_REPO --repo "$REPO" --body "$STATE"
 gh variable set DSH_PUBLIC_HOST --repo "$REPO" --body "dsh.example.com"
 gh variable set DSH_VERSION --repo "$REPO" --body "0.2.2-rc.1"
+# 可选：插件安装使用的 pnpm 版本（默认 11.28.5）
+# gh variable set PNPM_VERSION --repo "$REPO" --body "11.28.5"
 
 # 必填：固定版本 + 64 位 SHA-256（替换为实际值）
 gh variable set CLOUDFLARED_VERSION --repo "$REPO" --body "<cloudflared-version>"
@@ -173,6 +175,7 @@ sha256sum cloudflared-linux-amd64
 | `STATE_REPO` | 无（必填） | 私有状态仓库 `owner/name` |
 | `DSH_PUBLIC_HOST` | 无（必填） | 只写主机名，如 `dsh.example.com`，**不要带 `https://`、路径或结尾斜杠** |
 | `DSH_VERSION` | 无（必填，常用 `0.2.2-rc.1`） | 安装的 dsh 版本 |
+| `PNPM_VERSION` | `11.28.5` | 插件安装使用的 pnpm 版本 |
 | `CLOUDFLARED_VERSION` | 无（必填） | cloudflared 版本 |
 | `CLOUDFLARED_SHA256` | 无（必填） | cloudflared 二进制 SHA-256 |
 | `GITLEAKS_VERSION` | 无（必填） | 状态扫描工具版本 |
@@ -324,9 +327,10 @@ DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工
 
 ### 插件与凭据的持久化边界
 
-- 插件安装会写入 `profiles/web/package.json`、`pnpm-lock.yaml` 和 `cordis.patch.yml`，这些文件会进入快照；`node_modules/`、`.plugin-manager/`、`.dsh-market/` 和 `.npmrc` 被排除。重启后 DSH 会跳过缺失的 bundle 继续启动，插件页显示该插件不可用；用 `dsh plugin --profile web install` 或插件页重新安装即可。
-- 随 DSH 全局安装提供的官方 bundle 每次运行都会重新安装，不需要手动重装；只有 profile 外部安装的插件需要重装。
-- `.credentials.yaml` 默认不持久化（恢复后删除），模型 API key 重启后需要重新填写。要免人工恢复，可设置 `DSH_PERSIST_CREDENTIALS=true`，但凭据会进入快照并经过 gitleaks 扫描；更安全的做法是通过 Actions secret 以环境变量注入 key。
+- 插件安装会写入 `profiles/web/package.json`、`pnpm-lock.yaml` 和 `cordis.patch.yml`，这些文件会进入快照；`node_modules/`、`.plugin-manager/`、`.dsh-market/` 和 `.npmrc` 被排除。workflow 会安装 pnpm，`run.sh` 启动前检测到 profile 有外部依赖时会自动执行 `dsh plugin --profile web install`；失败不会阻止启动，插件页可重试。
+- 随 DSH 全局安装提供的官方 bundle 每次运行都会重新安装，不需要手动重装；只有 profile 外部安装的插件需要重装（通常由启动时的自动重装完成）。
+- 私有 registry 的认证写在 `.npmrc` 中，而 `.npmrc` 不持久化；如需私有源，请在启动时另行注入 `NPM_TOKEN`/`.npmrc`。构建脚本审批保存在 `pnpm-workspace.yaml`，会随快照保留。
+- `.credentials.yaml` 默认不持久化（恢复后删除），模型 API key 重启后需要重新填写。要免人工恢复，可设置 `DSH_PERSIST_CREDENTIALS=true`，但凭据会进入快照并经过 gitleaks 扫描；更安全的做法是通过 Actions secret 以环境变量注入 key（workflow 会把 `DEEPSEEK_API_KEY` 同时映射到 `DEEP_API_KEY`）。
 
 ### 磁盘保护
 

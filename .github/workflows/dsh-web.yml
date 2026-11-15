@@ -33,6 +33,7 @@ env:
   DSH_WORKSPACE: /home/runner/work1
   DSH_PUBLIC_HOST: ${{ vars.DSH_PUBLIC_HOST }}
   DSH_VERSION: ${{ vars.DSH_VERSION }}
+  PNPM_VERSION: ${{ vars.PNPM_VERSION || '11.28.5' }}
   STATE_REPO: ${{ vars.STATE_REPO }}
   STATE_BUDGET_MB: ${{ vars.STATE_BUDGET_MB || '5120' }}
   STATE_WARN_MB: ${{ vars.STATE_WARN_MB || '3072' }}
@@ -263,6 +264,13 @@ jobs:
           key: npm-${{ runner.os }}-${{ vars.DSH_VERSION }}
           restore-keys: |
             npm-${{ runner.os }}-
+
+      - name: Install pinned pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --no-fund --no-audit "pnpm@${PNPM_VERSION}"
+          pnpm --version
 
       - name: Install pinned dsh
         shell: bash
