@@ -13,11 +13,17 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `state.sh` | `state` 分支、`dsh-state` release 快照、锁、URL 发布、STOP 检查 |
+| `state.sh` | `state` 分支、`dsh-state` release 快照、冷会话归档、锁、URL 发布、STOP 检查 |
 | `sync-excludes.txt` | home/work 共用的 rsync 排除规则，`state.sh` 唯一排除来源 |
-| `run.sh` | cloudflared + dsh supervisor、checkpoint、磁盘保护、优雅停止 |
+| `run.sh` | cloudflared + dsh + session archive agent supervisor、checkpoint、磁盘保护、优雅停止 |
+| `session-archive-agent.mjs` | 冷会话归档的下载、sha256 校验、解压和替换 stub |
+| `tests/session-archive-test.sh` | `archive_cold_sessions` 的热/冷、stub、索引、复用逻辑测试 |
+| `tests/session-archive-agent-test.mjs` | agent 下载/校验/恢复的端到端测试（fake `gh`） |
+| `../dsh-session-archive/` | host 插件 `@dsh-web/session-archive` |
+| `../dsh-session-archive.overlay.yml` | 将插件插入 web profile 的 overlay |
 | `../.github/workflows/dsh-web.yml` | 启动、安装固定版本、scratch 选择、init/run 超时、汇总 |
 | `../.github/workflows/dsh-stop.yml` | 写 `DSH_STOP`、等待、兜底 cancel、清理变量 |
+| `../.github/workflows/session-archive-test.yml` | 手动运行归档和 agent 测试 |
 
 ## 2. 运行时契约
 
@@ -40,10 +46,11 @@ scratch 选择规则：候选挂载点必须同时满足 **≥20GB 可用空间*
 - `cloudflared.log`（0600）：隧道日志。
 - `state.log`（0600）：所有 `state.sh` 调用的输出。
 - `auto-restart.log`（0600）：自动重启 dispatch 的输出。
-- `dsh-web.log`、`cloudflared.log`、`state.log`、`auto-restart.log`（0600）：dsh/cloudflared 输出、状态脚本和自动重启诊断日志。
+- `session-archive.log`（0600）：归档 agent 的下载/恢复日志。
+- `session-archive.sock`（0600）：插件调用 agent 的本地 Unix socket。
 - `url.txt`（0600）：解析出的完整访问 URL。
 - `meta.json`：若存在，`publish-url` 会同步到控制分支；常规情况下由 `save` 更新控制分支的 meta。
-- `state/`：`rsync` staging 和打包临时目录。
+- `state/`：`rsync` staging、冷归档临时文件和打包临时目录。
 
 ### 2.2 环境变量
 
@@ -66,6 +73,13 @@ workflow 和脚本之间共享的变量：
 | `STATE_ASSET_PART_MB` | `1900` | `state.sh` | 分卷大小 |
 | `STATE_KEEP_SNAPSHOTS` | `2` | `state.sh` | 保留快照数 |
 | `STATE_MIN_FREE_MB` | `5120` | `state.sh` | 恢复/保存前的最小剩余空间 |
+| `DSH_PERSIST_CREDENTIALS` | `true` | `state.sh` | 是否把 `.credentials.yaml` 纳入快照；恢复后 chmod 0600 |
+| `SESSION_ARCHIVE_ENABLED` | `true` | `state.sh`、`run.sh` | 冷会话归档开关；插件未就绪时本次运行强制关闭 |
+| `SESSION_HOT_MAX` | `50` | `state.sh` | 保留完整日志的最近会话数 |
+| `SESSION_HOT_DAYS` | `30` | `state.sh` | 保留完整日志的最近天数 |
+| `SESSION_ARCHIVE_MIN_AGE_SEC` | `60` | `state.sh` | 最近修改的会话不归档 |
+| `SESSION_ARCHIVE_TOKEN` | 无（可选 secret） | agent | 下载归档的只读 token；回退 `STATE_REPO_TOKEN` |
+| `DSH_DEBUG_LOG_TAIL` | `false` | `run.sh` | 启动失败时输出遮蔽 URL 的 dsh 日志尾部 |
 | `DSH_PUBLIC_HOST` | 无（必填 variable） | `run.sh` | `dsh --public-url/--trusted-host` |
 | `DSH_VERSION` | 无（必填 variable） | workflow | 安装的 dsh 版本 |
 | `CLOUDFLARED_VERSION` | 无（必填 variable） | workflow | cloudflared 版本 |
@@ -122,8 +136,9 @@ state.sh status               # 输出紧凑 JSON（不含 URL/token）
 runtime/url.txt          当前完整访问 URL（0600，含访问令牌）
 runtime/meta.json        最近一次 save 的 raw_bytes/raw_mb/parts/scratch_free_mb/final
 runtime/lock.json        run_id、host、started、heartbeat（ISO 8601）
-runtime/state.json       当前快照：run_id、created、raw_bytes/raw_mb、home/work parts
+runtime/state.json       当前快照：run_id、created、raw_bytes/raw_mb、home/work parts、archived
 runtime/state.prev.json  上一份快照指针
+runtime/sessions-index.json 冷会话索引副本（来自 $DSH_HOME/.session-archive/index.json）
 .gitattributes           * -text；*.zst binary
 README.md
 ```
@@ -137,13 +152,15 @@ release tag：`dsh-state`（私有仓库）。
 ```text
 home-<run_id>-<ts>.tar.zst.part-NN
 work-<run_id>-<ts>.tar.zst.part-NN
+session-<session_id>-<sha16>.tar.zst
 ```
 
 - `home` 对应 `DSH_HOME`，`work` 对应 `DSH_WORKSPACE`；tar.zst 打包后按分卷切分，asset 名包含 `.tar.zst.part-NN`。
-- 每卷最大 `STATE_ASSET_PART_MB=1900`（约 1.86GiB），低于 GitHub 单 asset 2GiB 上限。
-- `state.json` / `state.prev.json` 分别记录当前和上一份快照的所有分卷、字节数和 sha256。
-- 清理逻辑默认保留 **当前 + 上一份**；将 `STATE_KEEP_SNAPSHOTS` 设为大于 2 可保留更多历史快照。最坏约 10GB（2 × 5GB 原始状态，zstd 压缩通常更小）。
-- 快照是 release asset，不是 git 对象；控制分支只保存指针。
+- 冷会话归档是完整的 `sessions/<project>/<id>` 目录；文件名带归档 SHA-256 前 16 位，索引保存完整 sha256 和原始日志字节数。
+- 每卷最大 `STATE_ASSET_PART_MB=1900`（约 1.86GiB），低于 GitHub 单 asset 2GiB 上限；超过 1.9GB 的单个会话保留完整日志而不归档。
+- `state.json` / `state.prev.json` 分别记录当前和上一份快照的所有分卷、字节数和 sha256；`archived` 记录冷归档数量和原始字节数。
+- 清理逻辑默认保留 **当前 + 上一份** home/work 快照；`session-*` 归档不参与该清理，会持续保留。最坏约 10GB（2 × 5GB 原始状态，zstd 压缩通常更小）。
+- 快照是 release asset，不是 git 对象；控制分支只保存指针和冷会话索引。
 
 ### 3.4 `init` 流程
 
@@ -153,22 +170,28 @@ work-<run_id>-<ts>.tar.zst.part-NN
 4. 读取 `runtime/state.json`，下载精确的 asset 名称/分卷到 staging，逐卷校验 sha256。
 5. `cat parts | tar --zstd -xpf - -C <target>` 恢复到 `DSH_HOME` / `DSH_WORKSPACE`。
 6. 恢复目录权限 0700，拒绝绝对/逃逸符号链接，并校验 `storages/workspace.json` 是合法 JSON（文件权限沿用归档内容）。
-7. 当前快照不可读时自动回退 `runtime/state.prev.json`。
-8. 有快照但两份都不可读时**中止**；绝不以空状态覆盖已有快照。
-9. 首次运行（没有 `state.json`）才允许空状态启动。
-10. 写入 `runtime/lock.json`（run_id/host/started/heartbeat）并用 amend 提交推送。
+7. 如果 `DSH_PERSIST_CREDENTIALS=true`，把恢复出的 `.credentials.yaml` 设为 0600；否则删除它。`storages/session_projcache*` 和冷会话 stub/index 随 home 一起恢复。
+8. 当前快照不可读时自动回退 `runtime/state.prev.json`。
+9. 有快照但两份都不可读时**中止**；绝不以空状态覆盖已有快照。
+10. 首次运行（没有 `state.json`）才允许空状态启动。
+11. 写入 `runtime/lock.json`（run_id/host/started/heartbeat）并用 amend 提交推送。
 
 ### 3.5 `save` 流程
 
 1. 检查 `DSH_SCRATCH` 剩余空间，低于 `STATE_MIN_FREE_MB` 直接失败。
-2. 用共享 `sync-excludes.txt` 把 live `DSH_HOME`/`DSH_WORKSPACE` rsync 到 `RUN_DIR/state/{home,work}`。
-3. 对 staging 执行 `gitleaks` 扫描；命中则本次保存失败（**exit 5**），需先清理状态中的密钥。
-4. 统计原始大小：达到 `STATE_WARN_MB` 记录告警；超过 `STATE_BUDGET_MB` 以 **exit 2** 退出，不上传。
-5. 确保 `dsh-state` release 存在；`tar -C <dir> --zstd -cpf ... .` 打包，按 1.9GB 分卷，计算每卷 sha256，并上传**所有**分卷。
-6. 成功后更新指针：仅当旧 `state.json` 通过 `pointer_valid` 校验时才复制到 `state.prev.json`；损坏的当前指针不会被提升（恢复时已删除，下一次保存会重新写入）。写入 `meta.json` 并刷新锁心跳。
-7. 用 `git commit --amend` + `--force-with-lease` 推送 `state` 分支；失败时重新 fetch 并基于新 head 重建提交、刷新 lease；assets 可能成为孤儿，但不会指向缺失文件。
-8. 清理不在当前/上一份指针中的 assets；默认保留 2 份，可通过 `STATE_KEEP_SNAPSHOTS` 增大。
-9. `--final` 使用同一流程；它总是执行，失败视为一次不完整关闭。
+2. 用共享 `sync-excludes.txt` 把 live `DSH_HOME`/`DSH_WORKSPACE` rsync 到 `RUN_DIR/state/{home,work}`；`DSH_PERSIST_CREDENTIALS=true` 时用 `--include=.credentials.yaml` 覆盖 home 的排除。
+3. 对 staging 执行 `gitleaks` 扫描；命中则本次保存失败（**exit 5**），需先清理状态中的密钥。`.credentials.yaml` 由路径 allowlist 放行。
+4. 统计冷会话：最近 `SESSION_HOT_MAX` 个或 `SESSION_HOT_DAYS` 天内为热；其余满足 `SESSION_ARCHIVE_MIN_AGE_SEC` 的会话：
+   - 若 runtime 索引中已有同字节数的归档，直接复用，不重复上传；
+   - 若 session 目录已是 stub，沿用索引条目；
+   - 否则打包完整目录、上传 `session-*`、校验 asset 存在，然后把 staging 中的日志替换为 header-only stub。
+   - 写入 `$STAGE_DIR/home/.session-archive/index.json`；失败时本次保存以 **exit 4** 中止，不产生不可恢复的 staging。
+5. 统计原始大小：达到 `STATE_WARN_MB` 记录告警；超过 `STATE_BUDGET_MB` 以 **exit 2** 退出，不上传。
+6. 确保 `dsh-state` release 存在；`tar -C <dir> --zstd -cpf ... .` 打包，按 1.9GB 分卷，计算每卷 sha256，并上传**所有**分卷。
+7. 成功后更新指针：仅当旧 `state.json` 通过 `pointer_valid` 校验时才复制到 `state.prev.json`；损坏的当前指针不会被提升。写入 `meta.json`（含 `archived`）并刷新锁心跳。
+8. 把 staging 的冷会话索引复制到 `runtime/sessions-index.json`。
+9. 用 `git commit --amend` + `--force-with-lease` 推送 `state` 分支；失败时重新 fetch 并基于新 head 重建提交、刷新 lease；assets 可能成为孤儿，但不会指向缺失文件。
+10. 清理不在当前/上一份指针中的 home/work assets；`session-*` 保留。`--final` 使用同一流程；它总是执行，失败视为一次不完整关闭。
 
 设计顺序是“先传 assets，再改指针”，因此任何中断都只会留下未引用资源，不会产生指向不存在 asset 的指针。
 
@@ -232,12 +255,30 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 - **陈旧锁**：`init` 在心跳超过 45 分钟时会记录告警并自动接管，不需要手动删除；心跳仍新鲜时以 exit 3 拒绝启动。不要在运行中手动改状态分支，避免与 supervisor 的提交竞争。
 - **仓库被误设为 public**：立即停止所有运行、改回 private、轮换 PAT 和 tunnel token；把已暴露的 URL 当作已泄露。
 
+### 3.12 冷会话归档与自动恢复
+
+- 热/冷判定按日志 mtime 降序：前 `SESSION_HOT_MAX` 个，或 mtime 在 `SESSION_HOT_DAYS` 天内，保持完整；其余归档。刚修改不到 `SESSION_ARCHIVE_MIN_AGE_SEC` 的会话跳过。
+- 索引 `$DSH_HOME/.session-archive/index.json` 只记录成功上传的归档；条目包含 `path`、`release`、`asset`、`sha256`、`full_bytes`、`updated_at`、`archived_at`。`state.sh` 同时把它复制到 `runtime/sessions-index.json`。
+- `$RUNTIME_DIR/sessions-index.json`（上一次保存的控制分支副本）用于识别“完整日志已归档且字节数未变”的会话，避免每个 checkpoint 重复上传；stub 小于 `full_bytes` 时直接沿用条目。
+- `session-archive-agent.mjs` 监听 `$RUN_DIR/session-archive.sock`。请求 `{"id":"<session-id>"}`，响应 `{"ok":true,"status":"present|restored"}` 或 `{"ok":false,"error":"..."}`。
+- agent 用 `gh release download` 下载 asset，流式计算 sha256，`tar --zstd` 解压到临时目录，校验恢复日志不小于 `full_bytes`，然后原子替换目标目录并 touch 日志。并发同 id 请求会串行化。
+- host 插件 `@dsh-web/session-archive` 读取同一索引；只在命中索引时调用 agent，然后委托原生 `sessionPersistence.open`。索引外会话不受影响。
+- `run.sh` 只有在 profile 依赖安装成功、host 插件存在、overlay 复制成功后，才用 `dsh --patch <profile>/session-archive.overlay.yml --profile web` 启动，并把 `ARCHIVE_READY` 视为 true；否则强制 `SESSION_ARCHIVE_ENABLED=false`，避免生成无法恢复的 stub。
+- 单个归档超过 1.9GB、上传失败、sha 校验失败或磁盘不足时保留完整日志并告警；不会删除唯一副本。
+- 冷会话恢复前不能被全文搜索，也不会因置顶而保留；列表仍只依赖 header 和投影缓存。
+
 ## 4. run.sh
 
 ### 4.1 启动顺序
 
 1. 校验 `DSH_HOME`/`DSH_WORKSPACE`/`RUN_DIR`/`STATE_*`，设置 `umask 077`，确认 `state.sh init` 已成功。
-2. 启动 cloudflared（日志 0600）：
+2. 准备冷归档：
+   - 如果 profile 还没有 `@dsh-web/session-archive` 依赖，执行 `dsh plugin --profile web add file:<checkout>/dsh-session-archive`；
+   - `restore_profile_plugins` 执行 `dsh plugin --profile web install`，重建 `node_modules`；
+   - 安装成功后把 `dsh-session-archive.overlay.yml` 复制到 `$DSH_HOME/profiles/web/`；
+   - 启动 `session-archive-agent.mjs` 并等待 `$RUN_DIR/session-archive.sock`；
+   - 任何一步失败都把本次运行的 `SESSION_ARCHIVE_ENABLED` 设为 `false`，并跳过 overlay。
+3. 启动 cloudflared（日志 0600）：
 
    ```bash
    env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u DEEPSEEK_API_KEY -u DSH_NOTIFY_WEBHOOK \
@@ -247,19 +288,21 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
    flag 必须在 `run` 之前；token 只通过环境变量传递，不写 `config.yml`。cloudflared 只拿到 `TUNNEL_TOKEN`，其余密钥全部剥离。
 
-3. 在 `$DSH_WORKSPACE` 启动 dsh（日志 0600），显式剥离令牌：
+4. 在 `$DSH_WORKSPACE` 启动 dsh（日志 0600），显式剥离令牌：
 
    ```bash
-   env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
-     -u DSH_NOTIFY_WEBHOOK \
-     dsh web --host 127.0.0.1 --port 3080 --no-open \
+   env -u STATE_REPO_TOKEN -u SESSION_ARCHIVE_TOKEN -u CF_TUNNEL_TOKEN \
+     -u GH_TOKEN -u GITHUB_TOKEN -u DSH_NOTIFY_WEBHOOK \
+     DSH_SESSION_ARCHIVE_SOCKET="$RUN_DIR/session-archive.sock" \
+     dsh --patch "$DSH_HOME/profiles/web/session-archive.overlay.yml" \
+     --profile web --host 127.0.0.1 --port 3080 --no-open \
      --public-url "https://$DSH_PUBLIC_HOST/" --trusted-host "$DSH_PUBLIC_HOST"
    ```
 
-   `DEEPSEEK_API_KEY` / `DEEP_API_KEY` 保留给模型 provider；workflow 会把 `DEEPSEEK_API_KEY` secret 同时映射到这两个变量。其余仓库/隧道令牌全部剥离。
+   `--patch` 必须放在 `--profile` 前；overlay 放在 profile 目录旁，插件按 profile 的 `node_modules` 解析。`DEEPSEEK_API_KEY` / `DEEP_API_KEY` 保留给模型 provider；workflow 会把 `DEEPSEEK_API_KEY` secret 同时映射到这两个变量。其余仓库/隧道/归档令牌全部剥离。
 
-4. 从 dsh 输出解析 `dsh web:` 行中的完整 URL（含访问令牌），**原始 URL** 写入 `RUN_DIR/url.txt`（0600），日志/终端只显示掩码版本，再调用**不带参数**的 `state.sh publish-url`；脚本从该文件读取 URL，避免令牌进入 argv。
-5. 进入监控循环；完整 URL 只出现在私有 `runtime/url.txt` 和本地 0600 日志中。
+5. 从 dsh 输出解析 `dsh web:` 行中的完整 URL（含访问令牌），**原始 URL** 写入 `RUN_DIR/url.txt`（0600），日志/终端只显示掩码版本，再调用**不带参数**的 `state.sh publish-url`；脚本从该文件读取 URL，避免令牌进入 argv。
+6. 进入监控循环；完整 URL 只出现在私有 `runtime/url.txt` 和本地 0600 日志中。
 
 ### 4.2 监控循环
 
@@ -286,7 +329,8 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 3. 清理 `$TMPDIR` 下的 DSH 临时目录；**不清理** `$DSH_HOME/spill`。
 4. `state.sh save --final`。
 5. `state.sh release-lock`。
-6. 输出公开 summary（无 URL/token，只说明 URL 位于私有 `runtime/url.txt`）。
+6. 停止 session archive agent 并删除 socket。
+7. 输出公开 summary（无 URL/token，只说明 URL 位于私有 `runtime/url.txt`）。
 
 正常停止通常 1–3 分钟。不要在 job 还在 final save 时手动 `cancel`。
 
@@ -305,9 +349,10 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
 ### 4.5 日志与掩码
 
-- `$RUN_DIR/dsh-web.log`、`$RUN_DIR/cloudflared.log`、`$RUN_DIR/state.log`、`$RUN_DIR/auto-restart.log`、`$RUN_DIR/url.txt` 都是 0600。
+- `$RUN_DIR/dsh-web.log`、`$RUN_DIR/cloudflared.log`、`$RUN_DIR/state.log`、`$RUN_DIR/auto-restart.log`、`$RUN_DIR/session-archive.log`、`$RUN_DIR/url.txt` 都是 0600；`session-archive.sock` 是 0600。
 - dsh URL 在 GitHub Actions 里额外用 `::add-mask::` 注册；日志里只出现阶段信息，不出现完整 URL。
 - 不使用 `set -x`；错误处理里也不 `echo` 环境变量。
+- 启动失败时，可选 `DSH_DEBUG_LOG_TAIL=true` 打印 dsh 日志尾部；URL 会被正则遮蔽，默认关闭，避免把 session 内容带进公开 job log。
 - 工作流不上传 artifacts，避免日志/状态泄露。
 
 ## 5. Workflow 接口
@@ -324,10 +369,11 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 - `runs-on: ubuntu-24.04`；`timeout-minutes: 355`。
 - `permissions: contents: read, actions: write`。
 - `concurrency: {group: dsh-web, cancel-in-progress: false}`。
-- Preflight 要求以下仓库变量非空：`STATE_REPO`、`DSH_PUBLIC_HOST`、`DSH_VERSION`、`CLOUDFLARED_VERSION`、`CLOUDFLARED_SHA256`、`GITLEAKS_VERSION`、`GITLEAKS_SHA256`；并要求 `STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN` 两个 secret。
-- Node 24 + npm cache；安装 dsh，下载 cloudflared/gitleaks 并按 64 位 hex SHA-256 校验。
+- Preflight 要求以下仓库变量非空：`STATE_REPO`、`DSH_PUBLIC_HOST`、`DSH_VERSION`、`CLOUDFLARED_VERSION`、`CLOUDFLARED_SHA256`、`GITLEAKS_VERSION`、`GITLEAKS_SHA256`；并要求 `STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN` 两个 secret。`SESSION_ARCHIVE_TOKEN` 可选，存在时会掩码。
+- Node 24 + npm cache；安装 dsh、pnpm，下载 cloudflared/gitleaks 并按 64 位 hex SHA-256 校验。
 - 选择 scratch（≥20GB、inode ≥5%；`/mnt` → `/mnt/dsh-scratch` → `/home/runner`）并导出 `DSH_SCRATCH`/`DSH_HOME`/`DSH_WORKSPACE`/`TMPDIR`/`STATE_CLONE`/`RUN_DIR`；`DSH_ALLOW_SMALL_SCRATCH=true` 可覆盖 20GB 要求。
 - `state.sh init` 超时 10 分钟；`run.sh` 用 `timeout --signal=TERM --kill-after=180s 20700` 包裹（345 分钟）；最后生成不含 URL 的公开 summary。
+- `run.sh` 会安装本地 host 插件和 overlay、启动 archive agent，并以 `dsh --patch ... --profile web` 启动；插件不可用时自动关闭本次归档。
 
 ### 5.2 `dsh-stop.yml`
 
@@ -345,6 +391,7 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 | `STATE_REPO_TOKEN` | secret | 公共仓库 | `state.sh`、`dsh-stop` |
 | `CF_TUNNEL_TOKEN` | secret | 公共仓库 | `run.sh` → cloudflared |
 | `DEEPSEEK_API_KEY` | secret（可选） | 公共仓库 | `run.sh` → dsh |
+| `SESSION_ARCHIVE_TOKEN` | secret（可选） | 公共仓库 | session archive agent |
 | `DSH_NOTIFY_WEBHOOK` | secret（可选） | 公共仓库 | 预留通知 |
 | `STATE_REPO` | variable（必填） | 公共仓库 | `state.sh`、`dsh-stop` |
 | `DSH_PUBLIC_HOST` | variable（必填） | 公共仓库 | `run.sh` |
@@ -352,7 +399,10 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 | `CLOUDFLARED_VERSION` / `CLOUDFLARED_SHA256` | variable（必填） | 公共仓库 | 安装/校验 |
 | `GITLEAKS_VERSION` / `GITLEAKS_SHA256` | variable（必填） | 公共仓库 | 安装/校验 |
 | `STATE_*` | variable | 公共仓库 | `state.sh` |
+| `DSH_PERSIST_CREDENTIALS` | variable | 公共仓库 | `state.sh` |
+| `SESSION_ARCHIVE_ENABLED` / `SESSION_HOT_MAX` / `SESSION_HOT_DAYS` / `SESSION_ARCHIVE_MIN_AGE_SEC` | variable | 公共仓库 | `state.sh`、`run.sh` |
 | `DSH_MIN_FREE_MB` / `DSH_TEMP_WARN_MB` | variable | 公共仓库 | `run.sh` |
+| `DSH_DEBUG_LOG_TAIL` | variable | 公共仓库 | `run.sh` 启动失败诊断 |
 | `DSH_ALLOW_SMALL_SCRATCH` | variable | 公共仓库 | workflow scratch 选择 |
 | `max_runtime_minutes` / `checkpoint_minutes` | dispatch input | workflow | `DSH_MAX_RUNTIME_MIN` / `DSH_CHECKPOINT_MIN` |
 | `DSH_STOP` | variable | **私有状态仓库** | `state.sh should-stop` |
@@ -367,10 +417,12 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 - 访问 URL 由 `run.sh` 写入 `$RUN_DIR/url.txt`（0600），`state.sh publish-url` **无参数**从文件读取；`<url>` 参数只允许手动调试，自动流程禁用。
 - `gh` 命令使用 `--repo "$STATE_REPO"` + `GH_TOKEN`，不把 token 拼进 remote URL。
 - `state.sh init` 强制检查状态仓库为 private。
-- 上传前 gitleaks 扫描；命中阻止保存并使本次运行以 exit 5 停止。
-- dsh 进程用 `env -u` 剥离 `STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN`、`GH_TOKEN`、`GITHUB_TOKEN`；cloudflared 启动后立即 unset `CF_TUNNEL_TOKEN`。
+- 上传前 gitleaks 扫描；命中阻止保存并使本次运行以 exit 5 停止。唯一放行的是 `DSH_PERSIST_CREDENTIALS=true` 时的 `$DSH_HOME/.credentials.yaml`；冷会话日志在归档前仍会被扫描。
+- dsh 进程用 `env -u` 剥离 `STATE_REPO_TOKEN`、`SESSION_ARCHIVE_TOKEN`、`CF_TUNNEL_TOKEN`、`GH_TOKEN`、`GITHUB_TOKEN`；cloudflared 启动后立即 unset `CF_TUNNEL_TOKEN`。归档 token 只存在于 agent 进程。
+- `.credentials.yaml` 在私有状态仓库中是明文；能读仓库或 token 的人就能读模型 key。该文件恢复后 chmod 0600。
+- 冷会话归档 asset 也在私有状态仓库；读权限等同于读完整会话历史。
 - 公共 summary 只说明 URL 位于私有 `runtime/url.txt`，绝不打印 URL。
-- 工作流不上传 artifacts；日志和 `url.txt` 都是 0600。
+- 工作流不上传 artifacts；日志和 `url.txt` 都是 0600。`DSH_DEBUG_LOG_TAIL` 默认关闭，开启时遮蔽 URL。
 
 ## 7. 验收与自检
 
@@ -378,6 +430,12 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 # 语法
 bash -n dsh-actions/state.sh
 bash -n dsh-actions/run.sh
+
+# 冷归档：热/冷、stub、索引、复用（需要 jq/zstd）
+bash dsh-actions/tests/session-archive-test.sh
+
+# agent：fake gh + 下载/校验/解压/替换
+node dsh-actions/tests/session-archive-agent-test.mjs
 
 # 如果本机有 shellcheck / actionlint
 shellcheck -x dsh-actions/state.sh dsh-actions/run.sh
@@ -398,6 +456,9 @@ grep -n 'publish-url' dsh-actions/run.sh dsh-actions/state.sh
 - 状态超过 5GB 时 `save` 返回 2；锁冲突返回 3；gitleaks 命中返回 5；1.9GB 分卷正确。
 - 资产名符合 `home-<run_id>-<ts>.tar.zst.part-NN` / `work-<run_id>-<ts>.tar.zst.part-NN`。
 - 连续 3 次 save 后只保留 2 份快照。
+- 冷会话：热/冷阈值、header-only stub、`session-*` asset、`sessions-index.json`、同一字节数不重复上传、stub 沿用条目。
+- 打开冷会话时 agent 下载并校验 sha256，替换 stub 后原生 `sessionPersistence.open` 读到完整日志；失败时保留 stub 且返回明确错误。
+- 插件未就绪时 `run.sh` 强制关闭归档，不产生新 stub。
 - `status` 返回含 `raw_mb` 的 JSON，`run.sh` 能据此切换 20 分钟 checkpoint。
 - `DSH_STOP` 等于 run id / `all` 时 `should-stop` 返回 0。
 - `publish-url` 无参数时从 `$RUN_DIR/url.txt` 读取；URL 不出现在 argv、公开日志或 summary 中。

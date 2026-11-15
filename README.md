@@ -29,17 +29,20 @@ GitHub Actions (ubuntu-24.04)
 │    ├─ 克隆私有仓库的 state 分支（控制文件，很小）
 │    ├─ 从私有 release dsh-state 下载快照（home/work 分卷）
 │    └─ 校验 sha256 后恢复到 /mnt 上的 DSH_HOME / DSH_WORKSPACE
+├─ session-archive-agent（本地 Unix socket）
+│    └─ 冷会话打开时从 release 下载归档、校验 sha256、解压恢复
 ├─ cloudflared（出站连接，使用 Named Tunnel Token）
 │    └─ Cloudflare 边缘 ──> https://<DSH_PUBLIC_HOST>
 └─ dsh web 监听 127.0.0.1:3080
+     ├─ host 插件 @dsh-web/session-archive 在 sessionPersistence.open 前调用 agent
      ├─ 每 10/20 分钟 checkpoint：打包、上传、更新 state 分支
      └─ 结束前 final save，然后释放锁
 ```
 
 - **公共仓库**：`2061969365/dsh-web`，只保存 `README.md`、工作流和 `dsh-actions/*.sh`。
 - **私有状态仓库**：`2061969365/dsh-web-state`，必须保持 private。
-- **`state` 分支**：单条滚动提交，保存 `runtime/url.txt`、`runtime/meta.json`、`runtime/state.json`、`runtime/state.prev.json`、`runtime/lock.json` 等小文件。
-- **`dsh-state` release**：保存 `home-<run_id>-<ts>.tar.zst.part-NN` 和 `work-<run_id>-<ts>.tar.zst.part-NN` 快照分卷，默认只保留最近 **2** 份（`STATE_KEEP_SNAPSHOTS` 可增大）。
+- **`state` 分支**：单条滚动提交，保存 `runtime/url.txt`、`runtime/meta.json`、`runtime/state.json`、`runtime/state.prev.json`、`runtime/sessions-index.json`、`runtime/lock.json` 等小文件。
+- **`dsh-state` release**：保存 `home-<run_id>-<ts>.tar.zst.part-NN`、`work-<run_id>-<ts>.tar.zst.part-NN` 快照分卷，以及冷会话归档 `session-<id>-<sha16>.tar.zst`。默认只保留最近 **2** 份快照（`STATE_KEEP_SNAPSHOTS` 可增大）；冷会话归档不参与这份快照清理，会一直保留。
 - **Named Tunnel**：Cloudflare 控制台里把 Public Hostname 指向 `http://127.0.0.1:3080`；runner 不需要开放入站端口。
 - **Runner**：`ubuntu-24.04`，工作流 job 超时 355 分钟，其中初始化 10 分钟、主程序最多 345 分钟。
 
@@ -50,6 +53,7 @@ GitHub Actions (ubuntu-24.04)
 | 状态硬预算 | **5GB**（`STATE_BUDGET_MB=5120`） | 原始状态超过后保存失败（exit 2）并停止本次运行，必须清理 |
 | 状态软告警 | 3GB（`STATE_WARN_MB=3072`） | 达到后日志告警，仍可继续 |
 | 快照保留 | **2 份**（当前 + 上一份） | 最坏约 10GB release 占用 |
+| 冷会话 | 最近 **50 个**或 **30 天**内为热；其余归档 | `SESSION_HOT_MAX=50`、`SESSION_HOT_DAYS=30` |
 | 单资源分卷 | **1.9GB**（`STATE_ASSET_PART_MB=1900`） | GitHub 单个 release asset 上限 2GiB |
 | checkpoint | **10 分钟**；原始状态 >2GB 时 **20 分钟** | 结束前一定执行 final save |
 | 运行时长 | 默认 **330 分钟**，job 上限 355 分钟 | 约 5.5 小时；自动重启可续上，但有短暂中断 |
@@ -123,6 +127,7 @@ Metadata 权限会自动包含。不要给这个 PAT 访问公共仓库或其他
 gh secret set STATE_REPO_TOKEN --repo "$REPO"   # 3.4 创建的 PAT
 gh secret set CF_TUNNEL_TOKEN --repo "$REPO"    # 3.7 的 Named Tunnel Token
 gh secret set DEEPSEEK_API_KEY --repo "$REPO"   # 可选，建议设置
+gh secret set SESSION_ARCHIVE_TOKEN --repo "$REPO" # 可选，冷会话归档的只读 token
 gh secret set DSH_NOTIFY_WEBHOOK --repo "$REPO" # 可选，预留通知 webhook
 ```
 
@@ -130,7 +135,8 @@ gh secret set DSH_NOTIFY_WEBHOOK --repo "$REPO" # 可选，预留通知 webhook
 | --- | --- | --- |
 | `STATE_REPO_TOKEN` | 是 | 读写私有状态仓库（控制分支 + release assets） |
 | `CF_TUNNEL_TOKEN` | 是 | cloudflared 连接 Named Tunnel |
-| `DEEPSEEK_API_KEY` | 否 | 注入 dsh 进程的模型 key；不写盘、不打印 |
+| `DEEPSEEK_API_KEY` | 否 | 注入 dsh 进程的模型 key；不写盘、不打印。不设置时可在页面填写并依赖 `.credentials.yaml` 持久化 |
+| `SESSION_ARCHIVE_TOKEN` | 否 | 冷会话 agent 下载归档用的只读 token；不设置时回退到 `STATE_REPO_TOKEN` |
 | `DSH_NOTIFY_WEBHOOK` | 否 | 预留通知 webhook（当前 workflow 只做掩码，未实际发送） |
 
 `gh secret set` 会交互式读取值，不要把 token 直接写在命令行参数里。
@@ -158,6 +164,15 @@ gh variable set STATE_ASSET_PART_MB --repo "$REPO" --body "1900"
 gh variable set STATE_KEEP_SNAPSHOTS --repo "$REPO" --body "2"
 gh variable set DSH_MIN_FREE_MB --repo "$REPO" --body "5120"
 gh variable set DSH_TEMP_WARN_MB --repo "$REPO" --body "8192"
+
+# 可选：会话冷归档（默认值如下）
+gh variable set SESSION_ARCHIVE_ENABLED --repo "$REPO" --body "true"
+gh variable set SESSION_HOT_MAX --repo "$REPO" --body "50"
+gh variable set SESSION_HOT_DAYS --repo "$REPO" --body "30"
+gh variable set SESSION_ARCHIVE_MIN_AGE_SEC --repo "$REPO" --body "60"
+
+# 可选：凭据持久化（默认 true；见 6. 持久化边界）
+gh variable set DSH_PERSIST_CREDENTIALS --repo "$REPO" --body "true"
 
 # 可选：允许 <20GB 的 scratch（不推荐，5GB 状态容易写满根盘）
 # gh variable set DSH_ALLOW_SMALL_SCRATCH --repo "$REPO" --body "true"
@@ -187,6 +202,11 @@ sha256sum cloudflared-linux-amd64
 | `STATE_MIN_FREE_MB` | `5120` | 状态恢复/保存前的最小剩余空间 |
 | `DSH_MIN_FREE_MB` | `5120` | 磁盘保护停止阈值 |
 | `DSH_TEMP_WARN_MB` | `8192` | 临时目录清理阈值 |
+| `DSH_PERSIST_CREDENTIALS` | `true` | 是否把 `.credentials.yaml` 写进私有状态快照 |
+| `SESSION_ARCHIVE_ENABLED` | `true` | 是否启用冷会话归档；host 插件未就绪时本次运行会自动关闭 |
+| `SESSION_HOT_MAX` | `50` | 保留为热会话的最近数量 |
+| `SESSION_HOT_DAYS` | `30` | 保留为热会话的最近天数 |
+| `SESSION_ARCHIVE_MIN_AGE_SEC` | `60` | 最近多少秒内修改过的会话不归档 |
 | `DSH_ALLOW_SMALL_SCRATCH` | `false` | 是否允许小于 20GB 的 scratch |
 
 单次运行上限和 checkpoint 间隔不是仓库变量，而是启动时的 `workflow_dispatch` 输入，见下一节。
@@ -256,13 +276,14 @@ gh run watch --repo "$REPO" <run-id>
 ### 模型 key
 
 - 推荐把 `DEEPSEEK_API_KEY` 配成 secret；工作流注入 dsh 进程，不落盘、不打印。
-- 其他 provider 的 key 可以在页面里临时填写，但**默认不持久化**，重启后需要重填。
+- 不设置 secret 时，可以在页面里填写模型 key。默认 `DSH_PERSIST_CREDENTIALS=true`，key 会写入 `$DSH_HOME/.credentials.yaml` 并存进**私有**状态快照；下次运行自动恢复。
+- `.credentials.yaml` 在私有状态仓库中是明文。状态仓库的 `STATE_REPO_TOKEN` 一旦泄露，等同于泄露模型 key；不要把这个仓库设为 public，并定期轮换 token。
 
 ### 打开与重开
 
 - 直接打开 `runtime/url.txt` 里的完整 URL。
 - 每次运行（包括自动重启）都会生成新的 URL 和新的 cookie 签名 secret：**重启后必须重新打开新 URL**，旧 URL/旧会话会失效。
-- 默认不同步 `.credentials.yaml`，所以不要指望登录态跨运行保留。
+- 页面填写的凭据和会话投影缓存会跨运行保留；如果更希望 key 只存在于 secret 中，设置 `DSH_PERSIST_CREDENTIALS=false` 并配置 `DEEPSEEK_API_KEY`。
 
 ### 停止
 
@@ -294,21 +315,34 @@ gh workflow run dsh-stop.yml --repo "$REPO"
 
 | 会随快照恢复 | 不会恢复（重启后丢失） |
 | --- | --- |
-| 会话、附件对象/文件/文件对象 | `$DSH_HOME/.credentials.yaml`（默认排除） |
-| `storages` 中的权威 JSON | `$DSH_HOME/spill/`（临时文件，旧 locator 会 404） |
-| profile 的 patch / `package.json` / `pnpm-lock` | `profiles/*/node_modules`、`.plugin-manager`、`.dsh-market` |
-| skills、`AGENTS.md`、`.anonymous-user-id` | `$DSH_HOME/cache/`、`logs/`、`storages/session_projcache*`、`storages/dsh-context/`、`attachments/v1/tmp/` |
-| 工作区中的普通源码文件 | `.env`、`.env.*`、`.npmrc`、`.netrc`、`.git-credentials` 等本地凭据文件 |
-| 工作区源码和 lockfile | 工作区的 `.git`、`node_modules`、`.venv`、`__pycache__`、`target/dist/build/.next` 等 |
+| 会话、附件对象/文件/文件对象 | `$DSH_HOME/spill/`（临时文件，旧 locator 会 404） |
+| `storages` 中的权威 JSON、`storages/session_projcache*` | `profiles/*/node_modules`、`.plugin-manager`、`.dsh-market` |
+| `$DSH_HOME/.credentials.yaml`（默认持久化，见下） | `$DSH_HOME/cache/`、`logs/`、`storages/dsh-context/`、`attachments/v1/tmp/` |
+| profile 的 patch / `package.json` / `pnpm-lock` | `.env`、`.env.*`、`.npmrc`、`.netrc`、`.git-credentials` 等本地凭据文件 |
+| skills、`AGENTS.md`、`.anonymous-user-id` | 工作区的 `.git`、`node_modules`、`.venv`、`__pycache__`、`target/dist/build/.next` 等 |
+| 工作区中的普通源码文件、源码和 lockfile | 工作区里的 `.env`、`.env.*` 等本地凭据文件 |
+| 冷会话归档的 header-only stub 和索引 | 冷会话的完整日志在 release asset 中，打开时自动恢复 |
 
 需要注意：
 
-- **凭据默认不持久化**：cookie secret 每次重建，重启后重新打开私有 URL；需要重新登录/重新填 key。
+- **凭据默认持久化**：`DSH_PERSIST_CREDENTIALS=true` 时 `.credentials.yaml` 进入私有状态快照，恢复后权限为 0600；设为 `false` 时恢复后会删除该文件。cookie secret 仍每次重建，重启后必须重新打开私有 URL。
 - **spill 不持久化**：它是临时中转，不是文件存储；重启后旧引用失效。
 - **workspace-changes 是临时目录**：按会话创建，会话释放时删除，不跨运行保留。
 - **工作区的 `.git` 不保存**：工作区里的 git 历史、remote 和未推送提交不会保留；重要代码请推到远端。
-- **快照只有 2 份**：当前和上一份，更早的 release assets 会被删除。
-- **5GB 是硬预算**：仓库、数据集、模型权重、大量附件都可能触发 `exit 2`；checkpoint 遇到 exit 2 会停止本次运行，需要清理后再启动。
+- **快照只有 2 份**：当前和上一份，更早的 release assets 会被删除；冷会话归档 `session-*` 不受这条限制。
+- **5GB 是硬预算**：仓库、数据集、模型权重、大量附件都可能触发 `exit 2`；checkpoint 遇到 exit 2 会停止本次运行，需要清理后再启动。冷会话归档的 release 存储不计入这 5GB，但会持续增长。
+
+### 会话冷归档
+
+会话日志是只追加的，长期使用会让状态超过 5GB。启用后：
+
+- 最近 `SESSION_HOT_MAX=50` 个会话，或最近 `SESSION_HOT_DAYS=30` 天内修改过的会话保持完整日志。
+- 其余会话在 checkpoint 时打包为 `session-<id>-<sha16>.tar.zst` 上传到私有 `dsh-state` release，本地只保留 header-only stub、投影缓存和 `.session-archive/index.json`。
+- 状态分支另存一份 `runtime/sessions-index.json`，便于人工查看。
+- 打开冷会话时，`@dsh-web/session-archive` host 插件先通过 `$RUN_DIR/session-archive.sock` 调用 agent；agent 下载归档、校验 sha256、解压并替换 stub，再交给原生 `sessionPersistence.open`。Web、SDK、ACP 三条路径共用这个入口。
+- 归档上传失败、下载失败或解压失败时保留完整日志或返回明确错误，不会静默截断历史。
+- 冷会话在恢复前不能全文搜索；列表仍只读 header 和投影缓存，恢复后才可搜索。置顶不会阻止归档。
+- 归档要求 host 插件已安装且 overlay 已加载；`run.sh` 在插件未就绪时把本次运行的 `SESSION_ARCHIVE_ENABLED` 强制设为 `false`，避免产生无法恢复的 stub。
 
 ## 7. 临时文件与磁盘
 
@@ -329,8 +363,10 @@ DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工
 
 - 插件安装会写入 `profiles/web/package.json`、`pnpm-lock.yaml` 和 `cordis.patch.yml`，这些文件会进入快照；`node_modules/`、`.plugin-manager/`、`.dsh-market/` 和 `.npmrc` 被排除。workflow 会安装 pnpm，`run.sh` 启动前检测到 profile 有外部依赖时会自动执行 `dsh plugin --profile web install`；失败不会阻止启动，插件页可重试。
 - 随 DSH 全局安装提供的官方 bundle 每次运行都会重新安装，不需要手动重装；只有 profile 外部安装的插件需要重装（通常由启动时的自动重装完成）。
+- 本仓库的 host 插件源码在 `dsh-session-archive/`。`run.sh` 会把本地 `file:` 依赖加入 profile，恢复依赖后再把 `dsh-session-archive.overlay.yml` 安装到 profile 旁边，并用 `dsh --patch <overlay> --profile web` 启动；这样 overlay 里的 `@dsh-web/session-archive` 能按 profile 的 `node_modules` 解析。
 - 私有 registry 的认证写在 `.npmrc` 中，而 `.npmrc` 不持久化；如需私有源，请在启动时另行注入 `NPM_TOKEN`/`.npmrc`。构建脚本审批保存在 `pnpm-workspace.yaml`，会随快照保留。
-- `.credentials.yaml` 默认不持久化（恢复后删除），模型 API key 重启后需要重新填写。要免人工恢复，可设置 `DSH_PERSIST_CREDENTIALS=true`，但凭据会进入快照并经过 gitleaks 扫描；更安全的做法是通过 Actions secret 以环境变量注入 key（workflow 会把 `DEEPSEEK_API_KEY` 同时映射到 `DEEP_API_KEY`）。
+- `.credentials.yaml` 默认持久化（`DSH_PERSIST_CREDENTIALS=true`），恢复后 chmod 0600；gitleaks 对这一个文件做路径 allowlist，其他文件仍按默认规则扫描。凭据在该私有仓库中是明文，最安全的做法仍是设置 `DEEPSEEK_API_KEY` secret 并关闭持久化。
+- `storages/session_projcache*` 现在会随快照恢复，重启后会话标题/列表摘要不会因缓存丢失而变成“未命名”。
 
 ### 磁盘保护
 
@@ -350,13 +386,14 @@ DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工
 ## 8. 安全
 
 - **公共仓库零秘密**：不提交 token、URL、状态、日志或截图；公开 summary 只说明 URL 位于私有 `runtime/url.txt`，绝不打印 URL。
-- **状态仓库必须 private**：`state.sh init` 会检查仓库可见性，公开则拒绝启动。`runtime/url.txt` 里的 URL 本身就是访问凭据。
-- **PAT 最小权限**：fine-grained、只对 `dsh-web-state` 开放 Contents + Variables，90 天过期并定期轮换。过期是初始化失败最常见的原因之一。
+- **状态仓库必须 private**：`state.sh init` 会检查仓库可见性，公开则拒绝启动。`runtime/url.txt` 里的 URL 本身就是访问凭据；`.credentials.yaml` 和冷会话归档也在这个仓库中。
+- **PAT 最小权限**：fine-grained、只对 `dsh-web-state` 开放 Contents + Variables，90 天过期并定期轮换。过期是初始化失败最常见的原因之一。`SESSION_ARCHIVE_TOKEN` 只需要 Contents: Read，可单独创建一个只读 token 给 session archive agent；不设置时回退到 `STATE_REPO_TOKEN`。
+- **明文凭据的边界**：`DSH_PERSIST_CREDENTIALS=true` 时模型 key 明文存在于私有 release 快照和 `state` 分支；能读状态仓库的人或 token 就能读 key。怀疑泄露时轮换 key、PAT 和 tunnel token。
 - **Cloudflare Access**：建议开启，给 hostname 套一层邮箱验证码/allow list；URL 泄露时仍有第二道门。
-- **仓库/隧道令牌不进入 dsh 或 cloudflared**：dsh 只保留模型 key（`DEEPSEEK_API_KEY`，并映射为 `DEEP_API_KEY` 供自定义 provider 使用）；`STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN`、`DSH_NOTIFY_WEBHOOK`、`GH_TOKEN`、`GITHUB_TOKEN` 会被 `env -u` 剥离。cloudflared 只拿到 `TUNNEL_TOKEN`。
-- **不打印、不进 argv、不进公开 summary**：git 认证走 `GIT_ASKPASS`，token 不拼进 git remote URL；访问 URL 由 supervisor 写入 `$RUN_DIR/url.txt`（0600），`state.sh publish-url` 从文件读取，不作为命令行参数；脚本使用 `umask 077`，日志 0600，禁用 `set -x`。注意：dsh 自身会把带令牌的 URL 打印到 `$DSH_LOG`，该文件仅存在于 runner 本地 scratch（0600），不会上传，也不写入 job summary。
+- **仓库/隧道/归档令牌不进入 dsh 或 cloudflared**：dsh 只保留模型 key（`DEEPSEEK_API_KEY`，并映射为 `DEEP_API_KEY` 供自定义 provider 使用）；`STATE_REPO_TOKEN`、`SESSION_ARCHIVE_TOKEN`、`CF_TUNNEL_TOKEN`、`DSH_NOTIFY_WEBHOOK`、`GH_TOKEN`、`GITHUB_TOKEN` 会被 `env -u` 剥离。cloudflared 只拿到 `TUNNEL_TOKEN`；归档 token 只在 agent 进程里。
+- **不打印、不进 argv、不进公开 summary**：git 认证走 `GIT_ASKPASS`，token 不拼进 git remote URL；访问 URL 由 supervisor 写入 `$RUN_DIR/url.txt`（0600），`state.sh publish-url` 从文件读取，不作为命令行参数；脚本使用 `umask 077`，日志 0600，禁用 `set -x`。注意：dsh 自身会把带令牌的 URL 打印到 `$DSH_LOG`，该文件仅存在于 runner 本地 scratch（0600），不会上传，也不写入 job summary。`DSH_DEBUG_LOG_TAIL=true` 只用于启动失败诊断，默认关闭，输出时会遮蔽 URL。
 - **无 artifacts**：工作流不上传任何 artifact，避免 URL/令牌随构建产物泄露。
-- **上传前扫描**：快照在保存前用 gitleaks 扫描；命中会阻止保存并停止本次运行（exit 5），请先清理状态中的密钥。
+- **上传前扫描**：快照在保存前用 gitleaks 扫描；命中会阻止保存并停止本次运行（exit 5），请先清理状态中的密钥。唯一例外是 `DSH_PERSIST_CREDENTIALS=true` 时的 `$DSH_HOME/.credentials.yaml`；冷会话日志仍按默认规则扫描，归档上传发生在这轮扫描之后。
 - **轮换/应急**：怀疑泄露时，先运行 dsh-stop；随后吊销 PAT、刷新 Cloudflare tunnel token、必要时删除私有 release assets 和 `state` 分支中的 URL 文件。
 
 ## 9. 故障排查
@@ -395,6 +432,15 @@ DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工
 - profile 的 `package.json` 和 `pnpm-lock` 会保留；在 profile 目录执行 `pnpm install` 可重建依赖。
 - 如果 runner 上没有 pnpm，先启用：`corepack enable pnpm`（或使用 profile 自带的包管理器）。依赖需要联网下载，首次会明显变慢。
 - 插件问题优先看 profile 日志和 dsh 日志；不要通过长期保存 `node_modules` 规避（会迅速吃满 5GB）。
+
+### 冷会话归档 / 自动恢复
+
+- 先看本次运行的日志里是否有 `session archive agent ready`、`profile plugins reinstalled` 和 dsh 进程的 `--patch` 参数；缺少任何一项时 `run.sh` 会把本次运行的 `SESSION_ARCHIVE_ENABLED` 强制设为 `false`，不会产生新的 stub。
+- `$DSH_HOME/.session-archive/index.json` 应包含冷会话条目；`runtime/sessions-index.json` 是它在状态分支上的副本。索引为空表示当前没有冷会话，或本次归档被关闭。
+- 打开冷会话失败时，看 `$RUN_DIR/session-archive.log`。常见原因：`SESSION_ARCHIVE_TOKEN`/`STATE_REPO_TOKEN` 没有读 release 的权限、归档 asset 被手动删除、sha256 不匹配、磁盘不足。
+- 归档 asset 是 `session-<id>-<sha16>.tar.zst`，位于私有 `dsh-state` release；单个归档超过 1.9GB 时会保留完整日志而不归档。
+- 冷会话在恢复前不能全文搜索，也不能被置顶保护；恢复后按普通会话处理。
+- 升级 DSH 后先跑 `session-archive-test.yml`；host 插件直接替换 `sessionPersistence.open`，DSH 的持久化接口变化可能导致它失效。
 
 ### 自动重启没有发生
 
@@ -442,11 +488,16 @@ Remove-Item -Recurse -Force F:\dsh-temp
 .
 ├── .github/workflows/dsh-web.yml   # 启动/监督/自动重启
 ├── .github/workflows/dsh-stop.yml  # 优雅停止
+├── .github/workflows/session-archive-test.yml # 冷归档单元/agent 测试
 ├── dsh-actions/
-│   ├── state.sh                    # 状态初始化、发布 URL、保存/恢复、锁
+│   ├── state.sh                    # 状态初始化、发布 URL、保存/恢复、锁、冷归档
 │   ├── sync-excludes.txt           # home/work 的共同排除规则
-│   ├── run.sh                      # cloudflared + dsh supervisor
+│   ├── run.sh                      # cloudflared + dsh + archive agent supervisor
+│   ├── session-archive-agent.mjs   # 冷会话下载/校验/恢复 agent
+│   ├── tests/                      # 归档和 agent 测试
 │   └── README.md                   # 维护者接口与运维细节
+├── dsh-session-archive/            # host 插件 @dsh-web/session-archive
+├── dsh-session-archive.overlay.yml # 把插件插入 web profile 的 overlay
 ├── PLAN.md                         # 设计/实现计划
 └── README.md
 ```
