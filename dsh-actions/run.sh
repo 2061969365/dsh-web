@@ -84,6 +84,7 @@ CLEANUP_DONE=0
 DSH_PID=""
 CFD_PID=""
 ARCHIVE_PID=""
+ARCHIVE_READY=false
 DSH_URL=""
 
 CHECKPOINT_EVERY_MIN="$CHECKPOINT_BASE_MIN"
@@ -336,16 +337,24 @@ restore_profile_plugins() {
   else
     warn "profile plugin reinstall failed; dsh will start and skip missing bundles"
   fi
+  if [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
+    ARCHIVE_READY=true
+  fi
 }
 
 ensure_session_archive_plugin() {
   local pkg="$DSH_HOME/profiles/web/package.json"
   local plugin_dir="$REPO_ROOT/dsh-session-archive"
   local plugin_name='@dsh-web/session-archive'
+  local overlay="$REPO_ROOT/dsh-session-archive.overlay.yml"
+  [ -f "$overlay" ] || { warn "session archive overlay not found"; return 0; }
   [ -d "$plugin_dir" ] || { warn "session archive plugin source not found"; return 0; }
   [ -f "$pkg" ] || { warn "profile package.json not found; session archive plugin not installed"; return 0; }
   command -v jq >/dev/null 2>&1 || { warn "jq is not available; cannot inspect the profile"; return 0; }
   if jq -e --arg name "$plugin_name" '.dependencies[$name] // empty' "$pkg" >/dev/null 2>&1; then
+    if [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
+      ARCHIVE_READY=true
+    fi
     return 0
   fi
   if ! command -v pnpm >/dev/null 2>&1; then
@@ -357,6 +366,9 @@ ensure_session_archive_plugin() {
          -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK -u SESSION_ARCHIVE_TOKEN \
          timeout 300 dsh plugin --profile web add "file:$plugin_dir" >>"$DSH_LOG" 2>&1; then
     log "session archive plugin added to profile web"
+    if [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
+      ARCHIVE_READY=true
+    fi
   else
     warn "could not add the session archive plugin; cold sessions will not auto-restore"
   fi
@@ -400,11 +412,10 @@ stop_session_archive() {
 
 start_dsh() {
   local -a patch_args=()
-  if [ -f "$REPO_ROOT/dsh-session-archive.overlay.yml" ] \
-     && [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
+  if [ "$ARCHIVE_READY" = true ]; then
     patch_args=(--patch "$REPO_ROOT/dsh-session-archive.overlay.yml")
-  elif [ -f "$REPO_ROOT/dsh-session-archive.overlay.yml" ]; then
-    warn "session archive plugin is not installed; starting without the overlay"
+  else
+    warn "session archive plugin is not ready; starting without the overlay"
   fi
   log "starting dsh web"
   (
@@ -704,6 +715,10 @@ main() {
   prune_stale_tmp
   ensure_session_archive_plugin
   restore_profile_plugins
+  if [ "$ARCHIVE_READY" != true ]; then
+    export SESSION_ARCHIVE_ENABLED=false
+    warn "session archiving is disabled for this run because the plugin is not ready"
+  fi
   start_session_archive
 
   if ! start_cloudflared; then
