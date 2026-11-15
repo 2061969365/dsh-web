@@ -1,0 +1,10 @@
+*.log
+*.tmp
+*.zst
+*.part-*
+.env
+.env.*
+state/
+run/
+node_modules/
+REVIEW.md

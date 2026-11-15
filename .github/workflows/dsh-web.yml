@@ -1,0 +1,358 @@
+name: dsh-web
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_restart:
+        description: Restart automatically after the normal runtime deadline
+        type: boolean
+        default: false
+      restarts_left:
+        description: Additional auto-restarts allowed (0 disables)
+        type: number
+        default: 0
+      max_runtime_minutes:
+        description: Supervisor runtime limit in minutes (1-330)
+        type: number
+        default: 330
+      checkpoint_minutes:
+        description: State checkpoint interval in minutes (1-60)
+        type: number
+        default: 10
+
+concurrency:
+  group: dsh-web
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  DSH_HOME: /home/runner/dsh-home
+  DSH_WORKSPACE: /home/runner/dsh-work
+  DSH_PUBLIC_HOST: ${{ vars.DSH_PUBLIC_HOST }}
+  DSH_VERSION: ${{ vars.DSH_VERSION }}
+  STATE_REPO: ${{ vars.STATE_REPO }}
+  STATE_BUDGET_MB: ${{ vars.STATE_BUDGET_MB || '5120' }}
+  STATE_WARN_MB: ${{ vars.STATE_WARN_MB || '3072' }}
+  STATE_ASSET_PART_MB: ${{ vars.STATE_ASSET_PART_MB || '1900' }}
+  STATE_KEEP_SNAPSHOTS: ${{ vars.STATE_KEEP_SNAPSHOTS || '2' }}
+  STATE_MIN_FREE_MB: ${{ vars.STATE_MIN_FREE_MB || '5120' }}
+  DSH_MIN_FREE_MB: ${{ vars.DSH_MIN_FREE_MB || '5120' }}
+  DSH_TEMP_WARN_MB: ${{ vars.DSH_TEMP_WARN_MB || '8192' }}
+  DSH_MAX_RUNTIME_MIN: ${{ inputs.max_runtime_minutes }}
+  DSH_CHECKPOINT_MIN: ${{ inputs.checkpoint_minutes }}
+  DSH_AUTO_RESTART: ${{ inputs.auto_restart }}
+  DSH_RESTARTS_LEFT: ${{ inputs.restarts_left }}
+  CLOUDFLARED_VERSION: ${{ vars.CLOUDFLARED_VERSION }}
+  CLOUDFLARED_SHA256: ${{ vars.CLOUDFLARED_SHA256 }}
+  GITLEAKS_VERSION: ${{ vars.GITLEAKS_VERSION }}
+  GITLEAKS_SHA256: ${{ vars.GITLEAKS_SHA256 }}
+
+jobs:
+  dsh-web:
+    name: dsh web
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Preflight
+        shell: bash
+        env:
+          STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DSH_NOTIFY_WEBHOOK: ${{ secrets.DSH_NOTIFY_WEBHOOK }}
+        run: |
+          set -euo pipefail
+
+          for name in STATE_REPO DSH_PUBLIC_HOST DSH_VERSION \
+                      CLOUDFLARED_VERSION CLOUDFLARED_SHA256 \
+                      GITLEAKS_VERSION GITLEAKS_SHA256; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required repository variable $name is not set"
+              exit 1
+            fi
+          done
+
+          for name in STATE_REPO_TOKEN CF_TUNNEL_TOKEN; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required secret $name is not set"
+              exit 1
+            fi
+            echo "::add-mask::${!name}"
+          done
+
+          if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+            echo "::add-mask::$DEEPSEEK_API_KEY"
+          fi
+          if [ -n "${DSH_NOTIFY_WEBHOOK:-}" ]; then
+            echo "::add-mask::$DSH_NOTIFY_WEBHOOK"
+          fi
+
+          case "$DSH_PUBLIC_HOST" in
+            *://*|*/*|*:*|*" "*)
+              echo "::error::DSH_PUBLIC_HOST must be a bare hostname without scheme, path, or spaces"
+              exit 1
+              ;;
+          esac
+
+          for name in CLOUDFLARED_SHA256 GITLEAKS_SHA256; do
+            value="${!name}"
+            case "$value" in
+              *[!0-9a-fA-F]*)
+                echo "::error::$name must be a hex SHA-256 digest"
+                exit 1
+                ;;
+            esac
+            if [ "${#value}" -ne 64 ]; then
+              echo "::error::$name must be a 64-character SHA-256 digest"
+              exit 1
+            fi
+          done
+
+          echo "dsh=$DSH_VERSION cloudflared=$CLOUDFLARED_VERSION gitleaks=$GITLEAKS_VERSION"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$DSH_AUTO_RESTART" in
+            true|false) ;;
+            *)
+              echo "::error::auto_restart must be true or false"
+              exit 1
+              ;;
+          esac
+
+          if ! [[ "$DSH_RESTARTS_LEFT" =~ ^[0-9]+$ ]]; then
+            echo "::error::restarts_left must be a non-negative integer"
+            exit 1
+          fi
+
+          if ! [[ "$DSH_MAX_RUNTIME_MIN" =~ ^[0-9]+$ ]]; then
+            echo "::error::max_runtime_minutes must be an integer"
+            exit 1
+          fi
+          if [ "$DSH_MAX_RUNTIME_MIN" -lt 1 ] || [ "$DSH_MAX_RUNTIME_MIN" -gt 330 ]; then
+            echo "::error::max_runtime_minutes must be between 1 and 330"
+            exit 1
+          fi
+
+          if ! [[ "$DSH_CHECKPOINT_MIN" =~ ^[0-9]+$ ]]; then
+            echo "::error::checkpoint_minutes must be an integer"
+            exit 1
+          fi
+          if [ "$DSH_CHECKPOINT_MIN" -lt 1 ] || [ "$DSH_CHECKPOINT_MIN" -gt 60 ]; then
+            echo "::error::checkpoint_minutes must be between 1 and 60"
+            exit 1
+          fi
+
+      - name: Select scratch
+        shell: bash
+        env:
+          DSH_ALLOW_SMALL_SCRATCH: ${{ vars.DSH_ALLOW_SMALL_SCRATCH || 'false' }}
+        run: |
+          set -euo pipefail
+
+          min_mb=20480
+          allow_small="${DSH_ALLOW_SMALL_SCRATCH:-false}"
+
+          pick_base() {
+            local root="$1"
+            local probe="$root/.dsh-scratch-probe-$$"
+            if mkdir -p "$probe" 2>/dev/null; then
+              rmdir "$probe" 2>/dev/null || true
+              printf '%s\n' "$root"
+              return 0
+            fi
+            if [ "$root" = /mnt ]; then
+              local sub=/mnt/dsh-scratch
+              if sudo mkdir -p "$sub" 2>/dev/null &&
+                 sudo chown "$(id -u):$(id -g)" "$sub" 2>/dev/null &&
+                 mkdir -p "$sub/.dsh-scratch-probe-$$" 2>/dev/null; then
+                rmdir "$sub/.dsh-scratch-probe-$$" 2>/dev/null || true
+                printf '%s\n' "$sub"
+                return 0
+              fi
+            fi
+            return 1
+          }
+
+          best=""
+          best_free=-1
+          best_inode=0
+          fallback=""
+          fallback_free=-1
+          fallback_inode=0
+
+          for root in /mnt /home/runner; do
+            [ -d "$root" ] || continue
+            base="$(pick_base "$root")" || {
+              echo "::warning::$root is not writable; skipping"
+              continue
+            }
+
+            free_mb="$(df -Pm "$base" | awk 'NR == 2 { print $4 }')"
+            inode_use="$(df -Pi "$base" | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')"
+            if ! [[ "$free_mb" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Unable to read free space for $base; skipping"
+              continue
+            fi
+            if ! [[ "$inode_use" =~ ^[0-9]+$ ]]; then
+              inode_use=0
+            fi
+            inode_free=$((100 - inode_use))
+            echo "$base: ${free_mb} MiB free, ${inode_free}% inodes free"
+
+            if [ "$free_mb" -gt "$fallback_free" ]; then
+              fallback="$base"
+              fallback_free="$free_mb"
+              fallback_inode="$inode_free"
+            fi
+
+            if [ "$free_mb" -ge "$min_mb" ] && [ "$inode_free" -ge 5 ] &&
+               [ "$free_mb" -gt "$best_free" ]; then
+              best="$base"
+              best_free="$free_mb"
+              best_inode="$inode_free"
+            fi
+          done
+
+          if [ -z "$best" ]; then
+            if [ "$allow_small" = "true" ] && [ -n "$fallback" ]; then
+              best="$fallback"
+              best_free="$fallback_free"
+              best_inode="$fallback_inode"
+              echo "::warning::No scratch mount meets 20 GiB free and 5% free inodes; DSH_ALLOW_SMALL_SCRATCH=true, using $best"
+            else
+              echo "::error::No writable scratch mount with >=20 GiB free and >=5% free inodes; set DSH_ALLOW_SMALL_SCRATCH=true to override"
+              exit 1
+            fi
+          fi
+
+          echo "Selected scratch $best (${best_free} MiB free, ${best_inode}% inodes free)"
+
+          {
+            echo "DSH_SCRATCH=$best"
+            echo "TMPDIR=$best/dsh-tmp"
+            echo "TMP=$best/dsh-tmp"
+            echo "TEMP=$best/dsh-tmp"
+            echo "STATE_CLONE=$best/dsh-state"
+            echo "RUN_DIR=$best/run"
+          } >> "$GITHUB_ENV"
+
+          mkdir -p "$best/dsh-tmp" "$best/run" "$DSH_HOME" "$DSH_WORKSPACE"
+          chmod 700 "$best/dsh-tmp" "$best/run" "$DSH_HOME" "$DSH_WORKSPACE"
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ vars.DSH_VERSION }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+
+      - name: Install pinned dsh
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${DSH_VERSION:?DSH_VERSION is required}"
+          npm install --global --no-fund --no-audit "@deepseek-ai/dsh@${DSH_VERSION}"
+          command -v dsh
+          dsh --version
+
+      - name: Install pinned cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CLOUDFLARED_VERSION:?CLOUDFLARED_VERSION is required}"
+          : "${CLOUDFLARED_SHA256:?CLOUDFLARED_SHA256 is required}"
+
+          version="${CLOUDFLARED_VERSION#v}"
+          url="https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-amd64"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          curl -fsSL --retry 3 --retry-delay 2 -o "$work/cloudflared" "$url"
+          printf '%s  %s\n' "$CLOUDFLARED_SHA256" "$work/cloudflared" | sha256sum --check --status
+          sudo install -m 0755 "$work/cloudflared" /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Install pinned gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GITLEAKS_VERSION:?GITLEAKS_VERSION is required}"
+          : "${GITLEAKS_SHA256:?GITLEAKS_SHA256 is required}"
+
+          version="${GITLEAKS_VERSION#v}"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          curl -fsSL --retry 3 --retry-delay 2 -o "$work/gitleaks.tar.gz" "$url"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$work/gitleaks.tar.gz" | sha256sum --check --status
+          tar -xzf "$work/gitleaks.tar.gz" -C "$work" gitleaks
+          sudo install -m 0755 "$work/gitleaks" /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Initialize state
+        id: init
+        shell: bash
+        timeout-minutes: 10
+        env:
+          STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+        run: bash dsh-actions/state.sh init
+
+      - name: Run dsh web
+        id: run
+        shell: bash
+        timeout-minutes: 345
+        env:
+          STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DSH_NOTIFY_WEBHOOK: ${{ secrets.DSH_NOTIFY_WEBHOOK }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: timeout --signal=TERM --kill-after=180s 20700 bash dsh-actions/run.sh
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## dsh-web"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| run | \`$GITHUB_RUN_ID\` |"
+            echo "| dsh | \`${DSH_VERSION:-unknown}\` |"
+            echo "| init | \`${INIT_OUTCOME:-skipped}\` |"
+            echo "| supervisor | \`${RUN_OUTCOME:-skipped}\` |"
+            echo "| scratch | \`${DSH_SCRATCH:-unknown}\` |"
+            echo "| public host | \`${DSH_PUBLIC_HOST:-unknown}\` |"
+            if [ -n "${DSH_SCRATCH:-}" ] && [ -d "${DSH_SCRATCH:-}" ]; then
+              echo "| scratch free | \`$(df -Ph "$DSH_SCRATCH" | awk 'NR == 2 { print $4 " of " $2 }')\` |"
+            fi
+            if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/url.txt" ]; then
+              echo "| url | stored in private state repo \`runtime/url.txt\` |"
+            fi
+            echo ""
+            echo "Logs and snapshots stay under the runner scratch directory. The token URL is written only to private state; this summary does not print it."
+          } >> "$GITHUB_STEP_SUMMARY"

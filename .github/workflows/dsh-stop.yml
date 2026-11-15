@@ -1,0 +1,123 @@
+name: dsh-stop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  STATE_REPO: ${{ vars.STATE_REPO }}
+
+jobs:
+  stop:
+    name: Request graceful stop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Preflight
+        shell: bash
+        env:
+          STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STATE_REPO:-}" ]; then
+            echo "::error::Required repository variable STATE_REPO is not set"
+            exit 1
+          fi
+          if [ -z "${STATE_REPO_TOKEN:-}" ]; then
+            echo "::error::Required secret STATE_REPO_TOKEN is not set"
+            exit 1
+          fi
+          echo "::add-mask::$STATE_REPO_TOKEN"
+
+      - name: Find queued or in-progress dsh-web run
+        id: find
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow dsh-web.yml \
+            --limit 20 \
+            --json databaseId,status \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued")][0].databaseId // empty')"
+          if [ -z "$run_id" ]; then
+            echo "No queued or in-progress dsh-web run; nothing to stop."
+          else
+            echo "Found dsh-web run $run_id"
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Set DSH_STOP and wait
+        if: steps.find.outputs.run_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+          TARGET_RUN_ID: ${{ steps.find.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          GH_TOKEN="$STATE_REPO_TOKEN" gh variable set DSH_STOP \
+            --repo "$STATE_REPO" \
+            --body "$TARGET_RUN_ID"
+          echo "Requested graceful stop of dsh-web run $TARGET_RUN_ID"
+
+          deadline=$((SECONDS + 540))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            status="$(gh run view "$TARGET_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json status \
+              --jq '.status' 2>/dev/null || true)"
+            case "$status" in
+              completed)
+                echo "dsh-web run $TARGET_RUN_ID stopped."
+                exit 0
+                ;;
+              ""|queued|in_progress|requested|waiting|pending)
+                ;;
+              *)
+                echo "dsh-web run $TARGET_RUN_ID reached unexpected status: $status"
+                exit 0
+                ;;
+            esac
+            sleep 10
+          done
+
+          echo "::warning::dsh-web run $TARGET_RUN_ID did not stop within 540s; cancelling"
+          gh run cancel "$TARGET_RUN_ID" --repo "$GITHUB_REPOSITORY"
+
+          for _ in $(seq 1 12); do
+            status="$(gh run view "$TARGET_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json status \
+              --jq '.status' 2>/dev/null || true)"
+            if [ "$status" = "completed" ]; then
+              echo "dsh-web run $TARGET_RUN_ID completed after cancel."
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Clear DSH_STOP
+        if: always() && steps.find.outputs.run_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+        run: |
+          set -uo pipefail
+          if out="$(gh variable delete DSH_STOP --repo "$STATE_REPO" 2>&1)"; then
+            echo "Cleared DSH_STOP."
+          else
+            case "$out" in
+              *"Not Found"*|*"not found"*|*"HTTP 404"*)
+                echo "DSH_STOP already clear."
+                ;;
+              *)
+                echo "::warning::Unable to clear DSH_STOP: $out"
+                ;;
+            esac
+          fi
