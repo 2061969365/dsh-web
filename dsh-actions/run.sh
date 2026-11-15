@@ -5,6 +5,8 @@ umask 077
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_SH="$SCRIPT_DIR/state.sh"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+readonly REPO_ROOT
 
 log() { printf '%s run.sh: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
 warn() { log "warning: $*"; }
@@ -66,6 +68,8 @@ readonly CFD_LOG="$RUN_DIR/cloudflared.log"
 readonly STATE_LOG="$RUN_DIR/state.log"
 readonly URL_FILE="$RUN_DIR/url.txt"
 readonly AUTO_RESTART_LOG="$RUN_DIR/auto-restart.log"
+readonly ARCHIVE_LOG="$RUN_DIR/session-archive.log"
+readonly ARCHIVE_SOCKET="$RUN_DIR/session-archive.sock"
 
 STARTED_AT="$(date +%s)"
 DEADLINE_EPOCH=$(( STARTED_AT + MAX_RUNTIME_MIN * 60 ))
@@ -79,6 +83,7 @@ CLEANUP_DONE=0
 
 DSH_PID=""
 CFD_PID=""
+ARCHIVE_PID=""
 DSH_URL=""
 
 CHECKPOINT_EVERY_MIN="$CHECKPOINT_BASE_MIN"
@@ -187,7 +192,7 @@ estimate_state_mb() {
   local -a home_excludes=(
     --exclude=spill --exclude=cache --exclude=logs --exclude=node_modules
     --exclude=.plugin-manager --exclude=.dsh-market --exclude=compatibility.json
-    --exclude='session_projcache*' --exclude=dsh-context --exclude=session-purge-trash
+    --exclude=dsh-context --exclude=session-purge-trash
     --exclude='*.bak*' --exclude='*.tmp' --exclude='*.tmpdir' --exclude='*.imported'
   )
   local -a work_excludes=(
@@ -333,14 +338,84 @@ restore_profile_plugins() {
   fi
 }
 
+ensure_session_archive_plugin() {
+  local pkg="$DSH_HOME/profiles/web/package.json"
+  local plugin_dir="$REPO_ROOT/dsh-session-archive"
+  local plugin_name='@dsh-web/session-archive'
+  [ -d "$plugin_dir" ] || { warn "session archive plugin source not found"; return 0; }
+  [ -f "$pkg" ] || { warn "profile package.json not found; session archive plugin not installed"; return 0; }
+  command -v jq >/dev/null 2>&1 || { warn "jq is not available; cannot inspect the profile"; return 0; }
+  if jq -e --arg name "$plugin_name" '.dependencies[$name] // empty' "$pkg" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v pnpm >/dev/null 2>&1; then
+    warn "pnpm is not installed; cannot add the session archive plugin"
+    return 0
+  fi
+  log "adding the session archive plugin to profile web"
+  if env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+         -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK -u SESSION_ARCHIVE_TOKEN \
+         timeout 300 dsh plugin --profile web add "file:$plugin_dir" >>"$DSH_LOG" 2>&1; then
+    log "session archive plugin added to profile web"
+  else
+    warn "could not add the session archive plugin; cold sessions will not auto-restore"
+  fi
+}
+
+start_session_archive() {
+  local script="$SCRIPT_DIR/session-archive-agent.mjs" waited=0
+  [ -f "$script" ] || { warn "session archive agent not found"; return 0; }
+  command -v node >/dev/null 2>&1 || { warn "node is not available; session archive disabled"; return 0; }
+  rm -f -- "$ARCHIVE_SOCKET" 2>/dev/null || true
+  : > "$ARCHIVE_LOG"
+  chmod 600 -- "$ARCHIVE_LOG" 2>/dev/null || true
+  env DSH_HOME="$DSH_HOME" RUN_DIR="$RUN_DIR" STATE_REPO="$STATE_REPO" \
+      STATE_TAG="${STATE_TAG:-dsh-state}" \
+      SESSION_ARCHIVE_TOKEN="${SESSION_ARCHIVE_TOKEN:-}" \
+      STATE_REPO_TOKEN="$STATE_REPO_TOKEN" \
+      node "$script" >>"$ARCHIVE_LOG" 2>&1 &
+  ARCHIVE_PID=$!
+  while (( waited < 100 )); do
+    if [[ -S "$ARCHIVE_SOCKET" ]]; then
+      log "session archive agent ready"
+      return 0
+    fi
+    if ! process_alive "$ARCHIVE_PID"; then
+      warn "session archive agent exited during startup; see $ARCHIVE_LOG"
+      ARCHIVE_PID=""
+      return 0
+    fi
+    sleep 0.1 || true
+    waited=$(( waited + 1 ))
+  done
+  warn "session archive agent did not create its socket; cold sessions will not auto-restore"
+  return 0
+}
+
+stop_session_archive() {
+  terminate_process "${ARCHIVE_PID:-}" 5 "session-archive"
+  ARCHIVE_PID=""
+  rm -f -- "$ARCHIVE_SOCKET" 2>/dev/null || true
+}
+
 start_dsh() {
+  local -a patch_args=()
+  if [ -f "$REPO_ROOT/dsh-session-archive.overlay.yml" ] \
+     && [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
+    patch_args=(--patch "$REPO_ROOT/dsh-session-archive.overlay.yml")
+  elif [ -f "$REPO_ROOT/dsh-session-archive.overlay.yml" ]; then
+    warn "session archive plugin is not installed; starting without the overlay"
+  fi
   log "starting dsh web"
   (
     cd -- "$DSH_WORKSPACE"
     exec env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN -u DSH_NOTIFY_WEBHOOK \
+      -u SESSION_ARCHIVE_TOKEN \
+      DSH_SESSION_ARCHIVE_SOCKET="$ARCHIVE_SOCKET" \
       dsh web --host 127.0.0.1 --port 3080 --no-open \
         --public-url "https://$DSH_PUBLIC_HOST/" \
-        --trusted-host "$DSH_PUBLIC_HOST"
+        --trusted-host "$DSH_PUBLIC_HOST" \
+        "${patch_args[@]}"
   ) >>"$DSH_LOG" 2>&1 &
   DSH_PID=$!
 }
@@ -576,6 +651,7 @@ cleanup() {
   if (( FINAL_SAVE_RC != 0 || RELEASE_LOCK_RC != 0 )) && (( EXIT_CODE == 0 )); then
     EXIT_CODE=1
   fi
+  stop_session_archive
   maybe_auto_restart
   write_summary
   log "supervisor finished (rc=$EXIT_CODE)"
@@ -612,7 +688,8 @@ main() {
   : > "$CFD_LOG"
   : > "$STATE_LOG"
   : > "$AUTO_RESTART_LOG"
-  chmod 600 -- "$DSH_LOG" "$CFD_LOG" "$STATE_LOG" "$AUTO_RESTART_LOG" 2>/dev/null || true
+  : > "$ARCHIVE_LOG"
+  chmod 600 -- "$DSH_LOG" "$CFD_LOG" "$STATE_LOG" "$AUTO_RESTART_LOG" "$ARCHIVE_LOG" 2>/dev/null || true
 
   if [[ -z "${TMPDIR:-}" ]]; then
     TMPDIR="$DSH_SCRATCH/dsh-tmp"
@@ -625,7 +702,9 @@ main() {
 
   prune_subprocess_spill
   prune_stale_tmp
+  ensure_session_archive_plugin
   restore_profile_plugins
+  start_session_archive
 
   if ! start_cloudflared; then
     STOP_REASON="cloudflared-startup"

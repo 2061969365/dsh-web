@@ -23,6 +23,10 @@ STATE_LOCK_STALE_MIN=${STATE_LOCK_STALE_MIN:-45}
 DSH_PERSIST_CREDENTIALS=${DSH_PERSIST_CREDENTIALS:-false}
 DSH_KEEP_STAGING=${DSH_KEEP_STAGING:-false}
 DSH_SKIP_GITLEAKS=${DSH_SKIP_GITLEAKS:-false}
+SESSION_ARCHIVE_ENABLED=${SESSION_ARCHIVE_ENABLED:-false}
+SESSION_HOT_MAX=${SESSION_HOT_MAX:-50}
+SESSION_HOT_DAYS=${SESSION_HOT_DAYS:-30}
+SESSION_ARCHIVE_MIN_AGE_SEC=${SESSION_ARCHIVE_MIN_AGE_SEC:-60}
 
 STATE_TAG=dsh-state
 EXCLUDES=$SCRIPT_DIR/sync-excludes.txt
@@ -131,6 +135,17 @@ validate_numbers() {
   [ "$STATE_ASSET_PART_MB" -le 1900 ] || die 1 "STATE_ASSET_PART_MB must be <= 1900 (GitHub asset limit)"
   [ "$STATE_MIN_FREE_MB" -ge 1024 ] || die 1 "STATE_MIN_FREE_MB must be >= 1024"
   [ "$STATE_KEEP_SNAPSHOTS" -ge 1 ] || die 1 "STATE_KEEP_SNAPSHOTS must be >= 1"
+  case $SESSION_ARCHIVE_ENABLED in
+    true|false) ;;
+    *) die 1 "SESSION_ARCHIVE_ENABLED must be true or false" ;;
+  esac
+  for var in SESSION_HOT_MAX SESSION_HOT_DAYS SESSION_ARCHIVE_MIN_AGE_SEC; do
+    val=${!var}
+    case $val in
+      ''|*[!0-9]*) die 1 "$var must be a positive integer" ;;
+    esac
+    [ "$val" -gt 0 ] || die 1 "$var must be a positive integer"
+  done
 }
 
 require_repo_env() {
@@ -523,6 +538,7 @@ update_meta_publish() {
 
 update_meta_save() {
   local sid=$1 raw=$2 abytes=$3 parts=$4 final=$5 over_warn=$6 duration=$7 count=$8
+  local archived_count=$9 archived_bytes=${10}
   local base json now free_s free_r
   base=$(meta_base)
   now=$(now_iso)
@@ -540,6 +556,8 @@ update_meta_save() {
     --argjson over_warn "$over_warn" \
     --argjson duration "$duration" \
     --argjson count "$count" \
+    --argjson archived_count "$archived_count" \
+    --argjson archived_bytes "$archived_bytes" \
     --argjson sfree "$free_s" \
     --argjson rfree "$free_r" \
     '. as $o
@@ -548,8 +566,10 @@ update_meta_save() {
          host:$host,
          updated_at:$now,
          disk:{scratch_free_mb:$sfree,root_free_mb:$rfree},
-         state:{id:$sid,raw_mb:$raw,archive_bytes:$abytes,parts:$parts,over_warn:$over_warn},
-         checkpoint:{count:$count,last_at:$now,last_final:$final,last_duration_s:$duration,last_raw_mb:$raw,last_snapshot:$sid}
+         state:{id:$sid,raw_mb:$raw,archive_bytes:$abytes,parts:$parts,over_warn:$over_warn,
+                archived:{sessions:$archived_count,bytes:$archived_bytes}},
+         checkpoint:{count:$count,last_at:$now,last_final:$final,last_duration_s:$duration,last_raw_mb:$raw,last_snapshot:$sid,
+                     archived:{sessions:$archived_count,bytes:$archived_bytes}}
        }' <<<"$base") || die 1 "cannot build save metadata"
   write_json_file "$META_FILE" "$json"
 }
@@ -816,11 +836,189 @@ verify_uploaded_parts() {
   return 0
 }
 
+write_session_stub() {
+  local log=$1 dir=$2 mtime=$3 tmp=$4
+  local stub_name header_tmp stub_tmp
+  stub_name=$(basename -- "$log")
+  header_tmp="$tmp/stub-header.$$"
+  stub_tmp="$tmp/stub.$$"
+  if [[ "$log" == *.zstd ]]; then
+    ( set +o pipefail; zstd -q -dc -- "$log" 2>/dev/null | head -n 1 > "$header_tmp" ) || true
+    if [ ! -s "$header_tmp" ]; then rm -f -- "$header_tmp" "$stub_tmp"; return 1; fi
+    if ! zstd -q -c -- "$header_tmp" > "$stub_tmp"; then rm -f -- "$header_tmp" "$stub_tmp"; return 1; fi
+  else
+    if ! head -n 1 -- "$log" > "$stub_tmp"; then rm -f -- "$header_tmp" "$stub_tmp"; return 1; fi
+  fi
+  if [ ! -s "$stub_tmp" ]; then rm -f -- "$header_tmp" "$stub_tmp"; return 1; fi
+  chmod 600 -- "$stub_tmp" 2>/dev/null || true
+  touch -d "@$mtime" -- "$stub_tmp" 2>/dev/null || true
+  if ! mv -f -- "$stub_tmp" "$dir/$stub_name"; then rm -f -- "$header_tmp" "$stub_tmp"; return 1; fi
+  find "$dir" -maxdepth 1 -type f -name 'session.v*.jsonl*' ! -name "$stub_name" -delete 2>/dev/null || true
+  : > "$dir/session.lock" || true
+  chmod 600 -- "$dir/session.lock" 2>/dev/null || true
+  rm -f -- "$header_tmp"
+  return 0
+}
+
+archive_cold_sessions() {
+  ARCHIVED_COUNT=0
+  ARCHIVED_BYTES=0
+  [ "$SESSION_ARCHIVE_ENABLED" = true ] || return 0
+  local sessions_root="$STAGE_DIR/home/sessions"
+  local index_dir="$STAGE_DIR/home/.session-archive"
+  local index_file="$index_dir/index.json"
+  local prev_index="$RUNTIME_DIR/sessions-index.json"
+  [ -f "$prev_index" ] || prev_index="$DSH_HOME/.session-archive/index.json"
+  [ -d "$sessions_root" ] || return 0
+  mkdir -p -- "$index_dir" || { warn "cannot create session archive index directory"; return 1; }
+  chmod 700 -- "$index_dir" 2>/dev/null || true
+
+  local prev_json='{"version":1,"sessions":{}}'
+  if [ -f "$prev_index" ] && jq -e . "$prev_index" >/dev/null 2>&1; then
+    prev_json=$(jq -c . "$prev_index") || prev_json='{"version":1,"sessions":{}}'
+  fi
+
+  local -a rows=()
+  local dir project id log mtime bytes
+  while IFS= read -r -d '' dir; do
+    project=${dir#"$sessions_root"/}
+    project=${project%%/*}
+    id=${dir##*/}
+    [[ "$project" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    log="$dir/session.v4.jsonl.zstd"
+    if [ ! -f "$log" ]; then
+      log=$(find "$dir" -maxdepth 1 -type f -name 'session.v*.jsonl*' -print 2>/dev/null | sort | tail -n 1 || true)
+    fi
+    [ -n "$log" ] && [ -f "$log" ] || continue
+    mtime=$(stat -c %Y -- "$log" 2>/dev/null || printf '0')
+    bytes=$(stat -c %s -- "$log" 2>/dev/null || printf '0')
+    case $mtime in ''|*[!0-9]*) mtime=0 ;; esac
+    case $bytes in ''|*[!0-9]*) bytes=0 ;; esac
+    rows+=("$mtime"$'\t'"$project"$'\t'"$id"$'\t'"$dir"$'\t'"$log"$'\t'"$bytes")
+  done < <(find "$sessions_root" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
+
+  local idx_json='{"version":1,"sessions":{}}'
+  if (( ${#rows[@]} == 0 )); then
+    write_json_file "$index_file" "$idx_json" || return 1
+    chmod 600 -- "$index_file" 2>/dev/null || true
+    return 0
+  fi
+
+  local -a sorted=()
+  mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1,1nr)
+  local now hot_cutoff i=0 new_count=0 reused_count=0
+  local row prev_entry prev_full updated archived tmp asset sha
+  now=$(now_epoch)
+  hot_cutoff=$(( now - SESSION_HOT_DAYS * 86400 ))
+  tmp=$(mktemp -d "$RUN_DIR/session-archive.XXXXXX") || { warn "cannot create session archive temp directory"; return 1; }
+
+  for row in "${sorted[@]}"; do
+    IFS=$'\t' read -r mtime project id dir log bytes <<<"$row"
+
+    prev_entry=$(jq -c --arg id "$id" '.sessions[$id] // empty' <<<"$prev_json" 2>/dev/null || true)
+    prev_full=0
+    if [ -n "$prev_entry" ]; then
+      prev_full=$(jq -r '.full_bytes // 0' <<<"$prev_entry" 2>/dev/null || printf '0')
+      case $prev_full in ''|*[!0-9]*) prev_full=0 ;; esac
+    fi
+
+    if [ -n "$prev_entry" ] && (( prev_full > 0 && bytes < prev_full )); then
+      idx_json=$(jq -c --arg id "$id" --argjson e "$prev_entry" '.sessions[$id]=$e' <<<"$idx_json") \
+        || { warn "cannot carry archived session $id in the index"; rm -rf -- "$tmp"; return 1; }
+      ARCHIVED_COUNT=$((ARCHIVED_COUNT + 1))
+      ARCHIVED_BYTES=$((ARCHIVED_BYTES + prev_full))
+      continue
+    fi
+
+    if (( i < SESSION_HOT_MAX )) || (( mtime >= hot_cutoff )); then
+      i=$((i + 1))
+      continue
+    fi
+    i=$((i + 1))
+    if (( mtime > now - SESSION_ARCHIVE_MIN_AGE_SEC )); then
+      continue
+    fi
+
+    if [ -n "$prev_entry" ] && (( prev_full > 0 && bytes == prev_full )); then
+      if ! write_session_stub "$log" "$dir" "$mtime" "$tmp"; then
+        warn "cannot replace unchanged session $id with a stub; keeping its full log"
+        continue
+      fi
+      idx_json=$(jq -c --arg id "$id" --argjson e "$prev_entry" '.sessions[$id]=$e' <<<"$idx_json") \
+        || { warn "cannot carry archived session $id in the index"; rm -rf -- "$tmp"; return 1; }
+      ARCHIVED_COUNT=$((ARCHIVED_COUNT + 1))
+      ARCHIVED_BYTES=$((ARCHIVED_BYTES + prev_full))
+      reused_count=$((reused_count + 1))
+      continue
+    fi
+
+    if ! tar -C "$sessions_root" --zstd -cpf "$tmp/$id.tar.zst" "$project/$id" 2>/dev/null; then
+      warn "cannot archive session $id; keeping its full log"
+      continue
+    fi
+    sha=$(sha256sum -- "$tmp/$id.tar.zst" | awk '{print $1}') \
+      || { warn "cannot hash archived session $id"; rm -f -- "$tmp/$id.tar.zst"; continue; }
+    asset="session-${id}-${sha:0:16}.tar.zst"
+    mv -f -- "$tmp/$id.tar.zst" "$tmp/$asset" \
+      || { warn "cannot name archived session $id"; continue; }
+    if [ "$(stat -c %s -- "$tmp/$asset" 2>/dev/null || printf '0')" -gt 1900000000 ]; then
+      warn "archived session $id exceeds the release asset limit; keeping its full log"
+      rm -f -- "$tmp/$asset"
+      continue
+    fi
+    if ! upload_part "$tmp/$asset"; then
+      warn "cannot upload archived session $id; keeping its full log"
+      rm -f -- "$tmp/$asset"
+      continue
+    fi
+    if ! verify_uploaded_parts "$tmp/$asset"; then
+      warn "uploaded archive for session $id is missing from the release; keeping its full log"
+      rm -f -- "$tmp/$asset"
+      continue
+    fi
+    if ! write_session_stub "$log" "$dir" "$mtime" "$tmp"; then
+      warn "cannot replace session $id with a stub; keeping its full log"
+      rm -f -- "$tmp/$asset"
+      continue
+    fi
+
+    updated=$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || now_iso)
+    archived=$(now_iso)
+    idx_json=$(jq -c \
+      --arg id "$id" \
+      --arg project "$project" \
+      --arg path "sessions/$project/$id" \
+      --arg release "$STATE_TAG" \
+      --arg asset "$asset" \
+      --arg sha "$sha" \
+      --argjson full "$bytes" \
+      --arg updated "$updated" \
+      --arg archived "$archived" \
+      '.sessions[$id]={project:$project,path:$path,release:$release,asset:$asset,sha256:$sha,full_bytes:$full,updated_at:$updated,archived_at:$archived}' \
+      <<<"$idx_json") || { warn "cannot index archived session $id"; rm -rf -- "$tmp"; return 1; }
+    ARCHIVED_COUNT=$((ARCHIVED_COUNT + 1))
+    ARCHIVED_BYTES=$((ARCHIVED_BYTES + bytes))
+    new_count=$((new_count + 1))
+    rm -f -- "$tmp/$asset"
+  done
+
+  write_json_file "$index_file" "$idx_json" || { warn "cannot write session archive index"; rm -rf -- "$tmp"; return 1; }
+  chmod 600 -- "$index_file" 2>/dev/null || true
+  rm -rf -- "$tmp"
+  log "session archive: ${ARCHIVED_COUNT} archived (${ARCHIVED_BYTES}B), ${new_count} newly archived, ${reused_count} reused"
+  return 0
+}
+
 write_gitleaks_config() {
   cat > "$GITLEAKS_CONFIG" <<'GITLEAKS_EOF'
 title = "dsh-state"
 [extend]
 useDefault = true
+
+[[allowlists]]
+description = "DSH credential store persisted by DSH_PERSIST_CREDENTIALS"
+paths = ['''\.credentials\.yaml$''']
 GITLEAKS_EOF
   chmod 600 -- "$GITLEAKS_CONFIG" 2>/dev/null || true
 }
@@ -939,6 +1137,9 @@ cmd_init() {
   fi
   restore_state
   chmod 700 -- "$DSH_HOME" "$DSH_WORKSPACE" || die 6 "cannot chmod state directories"
+  if [ "$DSH_PERSIST_CREDENTIALS" = true ] && [ -f "$DSH_HOME/.credentials.yaml" ]; then
+    chmod 600 -- "$DSH_HOME/.credentials.yaml" || die 6 "cannot chmod persisted credentials"
+  fi
   if [ "$RESTORED_FROM" != none ] && [ "$DSH_PERSIST_CREDENTIALS" != true ] && [ -f "$DSH_HOME/.credentials.yaml" ]; then
     rm -f -- "$DSH_HOME/.credentials.yaml" || die 6 "cannot remove persisted credentials"
     log "removed .credentials.yaml from restored home (default credentials are not persisted)"
@@ -1043,7 +1244,7 @@ cmd_save() {
     die 1 "rsync failed for home (exit $rs_rc)"
   fi
   rs_rc=0
-  rsync -a "${cred_args[@]}" --exclude-from="$EXCLUDES" "$DSH_WORKSPACE/" "$STAGE_DIR/work/" || rs_rc=$?
+  rsync -a --exclude-from="$EXCLUDES" "$DSH_WORKSPACE/" "$STAGE_DIR/work/" || rs_rc=$?
   if [ "$rs_rc" -eq 24 ]; then
     warn "rsync reported vanished files for work; continuing"
   elif [ "$rs_rc" -ne 0 ]; then
@@ -1051,6 +1252,11 @@ cmd_save() {
   fi
   validate_tree_symlinks "$STAGE_DIR/home" "$STAGE_DIR/work" "$DSH_HOME" "$DSH_WORKSPACE" || die 6 "unsafe symlink in staged home state"
   validate_tree_symlinks "$STAGE_DIR/work" "$STAGE_DIR/home" "$DSH_HOME" "$DSH_WORKSPACE" || die 6 "unsafe symlink in staged work state"
+  run_gitleaks || exit $?
+  ensure_state_release || die 1 "cannot ensure state release"
+  ARCHIVED_COUNT=0
+  ARCHIVED_BYTES=0
+  archive_cold_sessions || die 4 "session archive failed"
   local raw_mb
   raw_mb=$(du -sm -- "$STAGE_DIR" | awk '{print $1}') || die 1 "cannot measure staged state"
   case $raw_mb in
@@ -1064,7 +1270,6 @@ cmd_save() {
     over_warn=true
     warn "staged state ${raw_mb}MB reached soft budget ${STATE_WARN_MB}MB; continuing"
   fi
-  run_gitleaks || exit $?
   local snapshot_id current_id
   snapshot_id="${GITHUB_RUN_ID}-$(ts_compact)"
   current_id=
@@ -1134,9 +1339,12 @@ cmd_save() {
     --argjson work "$parts_work_json" \
     --argjson home_bytes "$home_bytes" \
     --argjson work_bytes "$work_bytes" \
+    --argjson archived_count "$ARCHIVED_COUNT" \
+    --argjson archived_bytes "$ARCHIVED_BYTES" \
     '{id:$id,run_id:$run_id,created_at:$created_at,host:$host,
       version:(if $version=="" then null else $version end),final:$final,
       raw_mb:$raw_mb,archive_bytes:$total_bytes,parts:$total_parts,over_warn:$over_warn,
+      archived:{sessions:$archived_count,bytes:$archived_bytes},
       trees:{home:{bytes:$home_bytes,parts:$home},work:{bytes:$work_bytes,parts:$work}}}') || die 1 "cannot build snapshot manifest"
   ensure_state_release || die 1 "cannot ensure state release"
   local p
@@ -1159,8 +1367,16 @@ cmd_save() {
   esac
   count=$((count + 1))
   duration=$(( $(now_epoch) - start_epoch ))
-  update_meta_save "$snapshot_id" "$raw_mb" "$total_bytes" "$total_parts" "$final" "$over_warn" "$duration" "$count"
+  update_meta_save "$snapshot_id" "$raw_mb" "$total_bytes" "$total_parts" "$final" "$over_warn" "$duration" "$count" "$ARCHIVED_COUNT" "$ARCHIVED_BYTES"
   refresh_lock_heartbeat
+  if [ -f "$STAGE_DIR/home/.session-archive/index.json" ]; then
+    cp -f -- "$STAGE_DIR/home/.session-archive/index.json" "$RUNTIME_DIR/sessions-index.json.tmp" \
+      && chmod 600 -- "$RUNTIME_DIR/sessions-index.json.tmp" 2>/dev/null \
+      && mv -f -- "$RUNTIME_DIR/sessions-index.json.tmp" "$RUNTIME_DIR/sessions-index.json" \
+      || warn "cannot publish session archive index to the control branch"
+  else
+    rm -f -- "$RUNTIME_DIR/sessions-index.json" 2>/dev/null || true
+  fi
   commit_control "state: save snapshot $snapshot_id (raw ${raw_mb}MB)"
   if ! cleanup_old_assets; then
     warn "old state asset cleanup failed; continuing"

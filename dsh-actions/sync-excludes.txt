@@ -7,7 +7,6 @@
 spill/
 cache/
 logs/
-storages/session_projcache*
 storages/dsh-context/
 attachments/v1/tmp/
 profiles/*/node_modules

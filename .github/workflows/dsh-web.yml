@@ -40,6 +40,11 @@ env:
   STATE_ASSET_PART_MB: ${{ vars.STATE_ASSET_PART_MB || '1900' }}
   STATE_KEEP_SNAPSHOTS: ${{ vars.STATE_KEEP_SNAPSHOTS || '2' }}
   STATE_MIN_FREE_MB: ${{ vars.STATE_MIN_FREE_MB || '5120' }}
+  DSH_PERSIST_CREDENTIALS: ${{ vars.DSH_PERSIST_CREDENTIALS || 'true' }}
+  SESSION_ARCHIVE_ENABLED: ${{ vars.SESSION_ARCHIVE_ENABLED || 'true' }}
+  SESSION_HOT_MAX: ${{ vars.SESSION_HOT_MAX || '50' }}
+  SESSION_HOT_DAYS: ${{ vars.SESSION_HOT_DAYS || '30' }}
+  SESSION_ARCHIVE_MIN_AGE_SEC: ${{ vars.SESSION_ARCHIVE_MIN_AGE_SEC || '60' }}
   DSH_MIN_FREE_MB: ${{ vars.DSH_MIN_FREE_MB || '5120' }}
   DSH_TEMP_WARN_MB: ${{ vars.DSH_TEMP_WARN_MB || '8192' }}
   DSH_MAX_RUNTIME_MIN: ${{ inputs.max_runtime_minutes }}
@@ -67,6 +72,7 @@ jobs:
         env:
           STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          SESSION_ARCHIVE_TOKEN: ${{ secrets.SESSION_ARCHIVE_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DSH_NOTIFY_WEBHOOK: ${{ secrets.DSH_NOTIFY_WEBHOOK }}
         run: |
@@ -91,6 +97,9 @@ jobs:
 
           if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
             echo "::add-mask::$DEEPSEEK_API_KEY"
+          fi
+          if [ -n "${SESSION_ARCHIVE_TOKEN:-}" ]; then
+            echo "::add-mask::$SESSION_ARCHIVE_TOKEN"
           fi
           if [ -n "${DSH_NOTIFY_WEBHOOK:-}" ]; then
             echo "::add-mask::$DSH_NOTIFY_WEBHOOK"
@@ -331,6 +340,7 @@ jobs:
         env:
           STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          SESSION_ARCHIVE_TOKEN: ${{ secrets.SESSION_ARCHIVE_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEP_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DSH_NOTIFY_WEBHOOK: ${{ secrets.DSH_NOTIFY_WEBHOOK }}

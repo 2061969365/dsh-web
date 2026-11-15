@@ -1,0 +1,21 @@
+name: session archive test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd jq
+      - name: Run archive tests
+        run: bash dsh-actions/tests/session-archive-test.sh

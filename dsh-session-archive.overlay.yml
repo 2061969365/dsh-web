@@ -1,0 +1,3 @@
+- insert:
+    - id: session-archive
+      name: '@dsh-web/session-archive'
