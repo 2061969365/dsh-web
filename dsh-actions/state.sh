@@ -1176,10 +1176,16 @@ cmd_should_stop() {
   validate_state_repo
   need_cmd gh
   local value rc=0
-  value=$(gh_state variable get DSH_STOP --repo "$STATE_REPO" --json value --jq '.value' 2>/dev/null) || rc=$?
+  value=$(gh_state variable get DSH_STOP --repo "$STATE_REPO" --json value --jq '.value' 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then
-    warn "cannot read DSH_STOP from $STATE_REPO (gh exit $rc)"
-    exit 1
+    case $value in
+      *"Not Found"*|*"not found"*|*"HTTP 404"*) exit 1 ;;
+      *)
+        value=${value//$'\n'/ }
+        warn "cannot read DSH_STOP from $STATE_REPO (gh exit $rc): $value"
+        exit 1
+        ;;
+    esac
   fi
   value=${value//$'\r'/}
   value=${value//$'\n'/}
