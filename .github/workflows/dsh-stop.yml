@@ -44,7 +44,7 @@ jobs:
             --workflow dsh-web.yml \
             --limit 20 \
             --json databaseId,status \
-            --jq '[.[] | select(.status == "in_progress" or .status == "queued")][0].databaseId // empty')"
+            --jq '[.[] | select(.status == "in_progress")][0].databaseId // [.[] | select(.status == "queued")][0].databaseId // empty')"
           if [ -z "$run_id" ]; then
             echo "No queued or in-progress dsh-web run; nothing to stop."
           else

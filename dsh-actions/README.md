@@ -330,7 +330,7 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 ### 5.2 `dsh-stop.yml`
 
 - `permissions: actions: write, contents: read`。
-- 找到 status 为 queued 或 in-progress 的 dsh-web run；没有则直接成功退出。
+- 优先找到 status 为 in-progress 的 dsh-web run，否则找 queued；没有则直接成功退出。
 - 用 `STATE_REPO_TOKEN` 把私有状态仓库的 `DSH_STOP` 变量设为该 run id。
 - 每 10 秒轮询 run 状态，最多等待 540 秒让 supervisor 完成 dsh 退出、final save 和锁释放。
 - 超时后兜底 `gh run cancel`（使用 `GITHUB_TOKEN`）。
