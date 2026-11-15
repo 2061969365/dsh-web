@@ -296,7 +296,7 @@ wait_for_url() {
 start_cloudflared() {
   local rc=0
   log "starting cloudflared"
-  env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u DEEPSEEK_API_KEY -u DSH_NOTIFY_WEBHOOK \
+  env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK \
     -u GH_TOKEN -u GITHUB_TOKEN TUNNEL_TOKEN="$CF_TUNNEL_TOKEN" cloudflared tunnel \
     --no-autoupdate --protocol http2 --grace-period 5s run \
     >>"$CFD_LOG" 2>&1 &

@@ -322,6 +322,12 @@ scratch 选择会实测候选挂载点的可用空间和 inode。若 `/mnt` 不�
 
 DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工作区时请把路径选在 `/home/runner/work1` 或它的子目录下；选择 `/home/runner` 下的其他路径（例如另一个 `work2`）在重启后不会恢复。
 
+### 插件与凭据的持久化边界
+
+- 插件安装会写入 `profiles/web/package.json`、`pnpm-lock.yaml` 和 `cordis.patch.yml`，这些文件会进入快照；`node_modules/`、`.plugin-manager/`、`.dsh-market/` 和 `.npmrc` 被排除。重启后 DSH 会跳过缺失的 bundle 继续启动，插件页显示该插件不可用；用 `dsh plugin --profile web install` 或插件页重新安装即可。
+- 随 DSH 全局安装提供的官方 bundle 每次运行都会重新安装，不需要手动重装；只有 profile 外部安装的插件需要重装。
+- `.credentials.yaml` 默认不持久化（恢复后删除），模型 API key 重启后需要重新填写。要免人工恢复，可设置 `DSH_PERSIST_CREDENTIALS=true`，但凭据会进入快照并经过 gitleaks 扫描；更安全的做法是通过 Actions secret 以环境变量注入 key。
+
 ### 磁盘保护
 
 - 每 30 秒采样 `/` 和 `$DSH_SCRATCH` 的可用空间与 inode。
@@ -343,7 +349,7 @@ DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工
 - **状态仓库必须 private**：`state.sh init` 会检查仓库可见性，公开则拒绝启动。`runtime/url.txt` 里的 URL 本身就是访问凭据。
 - **PAT 最小权限**：fine-grained、只对 `dsh-web-state` 开放 Contents + Variables，90 天过期并定期轮换。过期是初始化失败最常见的原因之一。
 - **Cloudflare Access**：建议开启，给 hostname 套一层邮箱验证码/allow list；URL 泄露时仍有第二道门。
-- **令牌不进入 dsh / cloudflared 进程**：启动命令用 `env -u` 剥离 `STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN`、`DEEPSEEK_API_KEY`、`DSH_NOTIFY_WEBHOOK`、`GH_TOKEN`、`GITHUB_TOKEN`；cloudflared 额外通过 `TUNNEL_TOKEN` 单独传隧道 token。
+- **仓库/隧道令牌不进入 dsh 或 cloudflared**：dsh 只保留模型 key（`DEEPSEEK_API_KEY`，并映射为 `DEEP_API_KEY` 供自定义 provider 使用）；`STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN`、`DSH_NOTIFY_WEBHOOK`、`GH_TOKEN`、`GITHUB_TOKEN` 会被 `env -u` 剥离。cloudflared 只拿到 `TUNNEL_TOKEN`。
 - **不打印、不进 argv、不进公开 summary**：git 认证走 `GIT_ASKPASS`，token 不拼进 git remote URL；访问 URL 由 supervisor 写入 `$RUN_DIR/url.txt`（0600），`state.sh publish-url` 从文件读取，不作为命令行参数；脚本使用 `umask 077`，日志 0600，禁用 `set -x`。注意：dsh 自身会把带令牌的 URL 打印到 `$DSH_LOG`，该文件仅存在于 runner 本地 scratch（0600），不会上传，也不写入 job summary。
 - **无 artifacts**：工作流不上传任何 artifact，避免 URL/令牌随构建产物泄露。
 - **上传前扫描**：快照在保存前用 gitleaks 扫描；命中会阻止保存并停止本次运行（exit 5），请先清理状态中的密钥。

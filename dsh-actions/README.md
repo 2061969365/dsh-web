@@ -251,10 +251,12 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
    ```bash
    env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
-     -u DEEPSEEK_API_KEY -u DSH_NOTIFY_WEBHOOK \
+     -u DSH_NOTIFY_WEBHOOK \
      dsh web --host 127.0.0.1 --port 3080 --no-open \
      --public-url "https://$DSH_PUBLIC_HOST/" --trusted-host "$DSH_PUBLIC_HOST"
    ```
+
+   `DEEPSEEK_API_KEY` / `DEEP_API_KEY` 保留给模型 provider；workflow 会把 `DEEPSEEK_API_KEY` secret 同时映射到这两个变量。其余仓库/隧道令牌全部剥离。
 
 4. 从 dsh 输出解析 `dsh web:` 行中的完整 URL（含访问令牌），**原始 URL** 写入 `RUN_DIR/url.txt`（0600），日志/终端只显示掩码版本，再调用**不带参数**的 `state.sh publish-url`；脚本从该文件读取 URL，避免令牌进入 argv。
 5. 进入监控循环；完整 URL 只出现在私有 `runtime/url.txt` 和本地 0600 日志中。

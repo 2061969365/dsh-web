@@ -324,6 +324,7 @@ jobs:
           STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEP_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DSH_NOTIFY_WEBHOOK: ${{ secrets.DSH_NOTIFY_WEBHOOK }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: timeout --signal=TERM --kill-after=180s 20700 bash dsh-actions/run.sh
