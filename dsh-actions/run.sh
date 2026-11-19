@@ -492,7 +492,7 @@ start_caddy() {
 
   : > "$CADDY_LOG"
   chmod 600 -- "$CADDY_LOG" 2>/dev/null || true
-  printf '{\n\tadmin off\n}\n\n:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\turi query token %s\n\treverse_proxy 127.0.0.1:%s {\n\t\tflush_interval -1\n\t}\n}\n' \
+  printf '{\n\tadmin off\n}\n\n:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\t@no_auth not header_regexp Cookie "dsh-auth-"\n\turi @no_auth query token %s\n\treverse_proxy 127.0.0.1:%s {\n\t\tflush_interval -1\n\t}\n}\n' \
     "$CADDY_PORT" "$DSH_WEB_USER" "$hash" "$token" "$DSH_PORT" > "$CADDYFILE"
   chmod 600 -- "$CADDYFILE" 2>/dev/null || true
 

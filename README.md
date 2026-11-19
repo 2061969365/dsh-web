@@ -34,7 +34,7 @@ GitHub Actions (ubuntu-24.04)
 ├─ cloudflared（出站连接，使用 Named Tunnel Token）
 │    └─ Cloudflare 边缘 ──> https://<DSH_PUBLIC_HOST>
 ├─ Caddy basic auth（127.0.0.1:3080，用户名/密码）
-│    └─ 注入本次 dsh process token，反代到 127.0.0.1:3081
+│    └─ 首次无 cookie 请求注入本次 dsh process token，反代到 127.0.0.1:3081
 └─ dsh web 监听 127.0.0.1:3081
      ├─ host 插件 @dsh-web/session-archive 在 sessionPersistence.open 前调用 agent
      ├─ 每 10/20 分钟 checkpoint：打包、上传、更新 state 分支
@@ -46,7 +46,7 @@ GitHub Actions (ubuntu-24.04)
 - **`state` 分支**：单条滚动提交，保存 `runtime/url.txt`、`runtime/meta.json`、`runtime/state.json`、`runtime/state.prev.json`、`runtime/sessions-index.json`、`runtime/lock.json` 等小文件。
 - **`dsh-state` release**：保存 `home-<run_id>-<ts>.tar.zst.part-NN`、`work-<run_id>-<ts>.tar.zst.part-NN` 快照分卷，以及冷会话归档 `session-<id>-<sha16>.tar.zst`。默认只保留最近 **2** 份快照（`STATE_KEEP_SNAPSHOTS` 可增大）；冷会话归档不参与这份快照清理，会一直保留。
 - **Named Tunnel**：Cloudflare 控制台里把 Public Hostname 指向 `http://127.0.0.1:3080`（Caddy）；runner 不需要开放入站端口。
-- **Caddy**：basic auth 入口，默认用户名 `dsh`，密码来自 `DSH_WEB_PASSWORD`；dsh 只监听 127.0.0.1:3081，token 由 Caddy 内部注入。
+- **Caddy**：basic auth 入口，默认用户名 `dsh`，密码来自 `DSH_WEB_PASSWORD`；dsh 只监听 127.0.0.1:3081，token 由 Caddy 仅在首次无 cookie 请求时注入。
 - **Runner**：`ubuntu-24.04`，工作流 job 超时 355 分钟，其中初始化 10 分钟、主程序最多 345 分钟。
 
 ## 2. 关键限制
@@ -274,14 +274,14 @@ gh run watch --repo "$REPO" <run-id>
 1. 选择 scratch 挂载点（优先 `/mnt`，不可写时尝试 `/mnt/dsh-scratch`，需 ≥20GB 且 inode ≥5%），设置 `TMPDIR` 等路径。
 2. 安装固定版本的 dsh、cloudflared、gitleaks、Caddy，并校验下载文件的 SHA-256/SHA-512。
 3. `state.sh init`：没有快照时从空状态开始；有快照时校验并恢复。
-4. 启动 `dsh web`（127.0.0.1:3081），解析它的 process token，再启动 Caddy basic auth 代理（127.0.0.1:3080），由 Caddy 把 token 注入上游；最后启动 cloudflared。
+4. 启动 `dsh web`（127.0.0.1:3081），解析它的 process token，再启动 Caddy basic auth 代理（127.0.0.1:3080）；Caddy 只在没有 `dsh-auth-*` cookie 的首次请求注入 token，dsh 设置 cookie 后 303 到干净 `/`。最后启动 cloudflared。
 5. 公开地址固定为 `https://$DSH_PUBLIC_HOST/`，浏览器会弹出 basic auth，用户名默认 `dsh`，密码是 `DSH_WEB_PASSWORD` secret。`runtime/url.txt` 只保存这个固定 URL，不再包含 token。
 6. 之后每 10/20 分钟 checkpoint。
 
 **打开**：
 
 - 直接访问 `https://<DSH_PUBLIC_HOST>/`，输入用户名和 `DSH_WEB_PASSWORD`；不需要再读 `runtime/url.txt`。
-- dsh 的 access token 每次运行都会换，但只存在于 runner 内部的 Caddy 配置中；Caddy 每次启动重新读取，你不需要复制。
+- dsh 的 access token 每次运行都会换，但只存在于 runner 内部的 Caddy 配置中；Caddy 只在首次请求注入，之后浏览器用 dsh 的 auth cookie，你不需要复制 token。
 - `runtime/url.txt` 仍会更新，便于确认当前公开地址；它不是密码。
 
 ## 5. 日常使用
@@ -295,7 +295,7 @@ gh run watch --repo "$REPO" <run-id>
 ### 打开与重开
 
 - 直接打开 `https://<DSH_PUBLIC_HOST>/`，输入用户名（默认 `dsh`）和 `DSH_WEB_PASSWORD`。
-- dsh 每次运行都会生成新的 access token 和 cookie secret，但 Caddy 会在内部换成新 token；**你的 URL 和密码不变**，不需要每次重新复制长 URL。
+- dsh 每次运行都会生成新的 access token 和 cookie secret，但 Caddy 会在首次无 cookie 请求时注入新 token；**你的 URL 和密码不变**，不需要每次重新复制长 URL。
 - 页面填写的凭据和会话投影缓存会跨运行保留；如果更希望 key 只存在于 secret 中，设置 `DSH_PERSIST_CREDENTIALS=false` 并配置 `DEEPSEEK_API_KEY`。
 
 ### 停止

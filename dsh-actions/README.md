@@ -310,7 +310,7 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
    `--patch` 必须放在 `--profile` 前；overlay 放在 profile 目录旁，插件按 profile 的 `node_modules` 解析。`DEEPSEEK_API_KEY` / `DEEP_API_KEY` 保留给模型 provider；workflow 会把 `DEEPSEEK_API_KEY` secret 同时映射到这两个变量。其余仓库/隧道/归档/网页密码全部剥离。
 
-5. 从 dsh 输出解析 `dsh web:` 行，提取本次 process token；用 `caddy hash-password` 生成密码 hash，写入 0600 的 `Caddyfile`，启动 Caddy（127.0.0.1:3080，basic auth，反代 127.0.0.1:3081，`uri query token <token>`）。Caddy 就绪后把固定 `https://$DSH_PUBLIC_HOST/` 写入 `RUN_DIR/url.txt`，再调用**不带参数**的 `state.sh publish-url`。
+5. 从 dsh 输出解析 `dsh web:` 行，提取本次 process token；用 `caddy hash-password` 生成密码 hash，写入 0600 的 `Caddyfile`，启动 Caddy（127.0.0.1:3080，basic auth，反代 127.0.0.1:3081）。Caddy 只在请求没有 `dsh-auth-*` cookie 时用 `uri query token <token>` 注入 token；dsh 验证后会设置 cookie 并 303 到干净 `/`，后续请求靠 cookie，避免 token 每次注入导致的 303 循环。Caddy 就绪后把固定 `https://$DSH_PUBLIC_HOST/` 写入 `RUN_DIR/url.txt`，再调用**不带参数**的 `state.sh publish-url`。
 6. 进入监控循环；token 只存在于 runner 的 `Caddyfile` 和 dsh 自身 0600 日志中，公开状态只保存固定 URL。
 
 ### 4.2 监控循环
