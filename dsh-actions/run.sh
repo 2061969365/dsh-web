@@ -485,6 +485,9 @@ start_caddy() {
     || { warn "the dsh access token contains unsupported characters"; return 1; }
   [[ "$token" != *'&'* && "$token" != *'#'* && "$token" != *'%'* && "$token" != *'?'* ]] \
     || { warn "the dsh access token contains query-unsafe characters"; return 1; }
+  local marker
+  marker="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+  [[ -n "$marker" ]] || { warn "could not derive the caddy marker"; return 1; }
   hash="$(printf '%s' "$DSH_WEB_PASSWORD" | caddy hash-password 2>/dev/null)" \
     || { warn "could not hash DSH_WEB_PASSWORD"; return 1; }
   [[ "$hash" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] \
@@ -492,8 +495,8 @@ start_caddy() {
 
   : > "$CADDY_LOG"
   chmod 600 -- "$CADDY_LOG" 2>/dev/null || true
-  printf '{\n\tadmin off\n}\n\n:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\t@no_auth not header_regexp Cookie "dsh-auth-"\n\turi @no_auth query token %s\n\treverse_proxy 127.0.0.1:%s {\n\t\tflush_interval -1\n\t}\n}\n' \
-    "$CADDY_PORT" "$DSH_WEB_USER" "$hash" "$token" "$DSH_PORT" > "$CADDYFILE"
+  printf '{\n\tadmin off\n}\n\n:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\t@needs_token not header_regexp Cookie "dsh-caddy=%s"\n\turi @needs_token query token %s\n\theader @needs_token +Set-Cookie "dsh-caddy=%s; Path=/; HttpOnly; SameSite=Strict; Secure"\n\t@has_marker header_regexp Cookie "dsh-caddy=%s"\n\turi @has_marker query -token\n\treverse_proxy 127.0.0.1:%s {\n\t\tflush_interval -1\n\t}\n}\n' \
+    "$CADDY_PORT" "$DSH_WEB_USER" "$hash" "$marker" "$token" "$marker" "$marker" "$DSH_PORT" > "$CADDYFILE"
   chmod 600 -- "$CADDYFILE" 2>/dev/null || true
 
   if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >>"$CADDY_LOG" 2>&1; then
