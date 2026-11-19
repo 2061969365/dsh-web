@@ -56,6 +56,9 @@ env:
   CLOUDFLARED_SHA256: ${{ vars.CLOUDFLARED_SHA256 }}
   GITLEAKS_VERSION: ${{ vars.GITLEAKS_VERSION }}
   GITLEAKS_SHA256: ${{ vars.GITLEAKS_SHA256 }}
+  CADDY_VERSION: ${{ vars.CADDY_VERSION }}
+  CADDY_SHA512: ${{ vars.CADDY_SHA512 }}
+  DSH_WEB_USER: ${{ vars.DSH_WEB_USER || 'dsh' }}
 
 jobs:
   dsh-web:
@@ -73,6 +76,7 @@ jobs:
         env:
           STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          DSH_WEB_PASSWORD: ${{ secrets.DSH_WEB_PASSWORD }}
           SESSION_ARCHIVE_TOKEN: ${{ secrets.SESSION_ARCHIVE_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DSH_NOTIFY_WEBHOOK: ${{ secrets.DSH_NOTIFY_WEBHOOK }}
@@ -81,14 +85,15 @@ jobs:
 
           for name in STATE_REPO DSH_PUBLIC_HOST DSH_VERSION \
                       CLOUDFLARED_VERSION CLOUDFLARED_SHA256 \
-                      GITLEAKS_VERSION GITLEAKS_SHA256; do
+                      GITLEAKS_VERSION GITLEAKS_SHA256 \
+                      CADDY_VERSION CADDY_SHA512; do
             if [ -z "${!name:-}" ]; then
               echo "::error::Required repository variable $name is not set"
               exit 1
             fi
           done
 
-          for name in STATE_REPO_TOKEN CF_TUNNEL_TOKEN; do
+          for name in STATE_REPO_TOKEN CF_TUNNEL_TOKEN DSH_WEB_PASSWORD; do
             if [ -z "${!name:-}" ]; then
               echo "::error::Required secret $name is not set"
               exit 1
@@ -127,7 +132,18 @@ jobs:
             fi
           done
 
-          echo "dsh=$DSH_VERSION cloudflared=$CLOUDFLARED_VERSION gitleaks=$GITLEAKS_VERSION"
+          case "$CADDY_SHA512" in
+            *[!0-9a-fA-F]*)
+              echo "::error::CADDY_SHA512 must be a hex SHA-512 digest"
+              exit 1
+              ;;
+          esac
+          if [ "${#CADDY_SHA512}" -ne 128 ]; then
+            echo "::error::CADDY_SHA512 must be a 128-character SHA-512 digest"
+            exit 1
+          fi
+
+          echo "dsh=$DSH_VERSION cloudflared=$CLOUDFLARED_VERSION gitleaks=$GITLEAKS_VERSION caddy=$CADDY_VERSION"
 
       - name: Validate inputs
         shell: bash
@@ -326,6 +342,24 @@ jobs:
           sudo install -m 0755 "$work/gitleaks" /usr/local/bin/gitleaks
           gitleaks version
 
+      - name: Install pinned caddy
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CADDY_VERSION:?CADDY_VERSION is required}"
+          : "${CADDY_SHA512:?CADDY_SHA512 is required}"
+
+          version="${CADDY_VERSION#v}"
+          url="https://github.com/caddyserver/caddy/releases/download/v${version}/caddy_${version}_linux_amd64.tar.gz"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          curl -fsSL --retry 3 --retry-delay 2 -o "$work/caddy.tar.gz" "$url"
+          printf '%s  %s\n' "$CADDY_SHA512" "$work/caddy.tar.gz" | sha512sum --check --status
+          tar -xzf "$work/caddy.tar.gz" -C "$work" caddy
+          sudo install -m 0755 "$work/caddy" /usr/local/bin/caddy
+          caddy version
+
       - name: Initialize state
         id: init
         shell: bash
@@ -341,6 +375,7 @@ jobs:
         env:
           STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          DSH_WEB_PASSWORD: ${{ secrets.DSH_WEB_PASSWORD }}
           SESSION_ARCHIVE_TOKEN: ${{ secrets.SESSION_ARCHIVE_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEP_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -371,8 +406,8 @@ jobs:
               echo "| scratch free | \`$(df -Ph "$DSH_SCRATCH" | awk 'NR == 2 { print $4 " of " $2 }')\` |"
             fi
             if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/url.txt" ]; then
-              echo "| url | stored in private state repo \`runtime/url.txt\` |"
+              echo "| access | fixed public URL + Caddy basic auth (password not printed) |"
             fi
             echo ""
-            echo "Logs and snapshots stay under the runner scratch directory. The token URL is written only to private state; this summary does not print it."
+            echo "Logs and snapshots stay under the runner scratch directory. The dsh token and Caddy password hash stay in the local 0600 Caddyfile; this summary does not print them."
           } >> "$GITHUB_STEP_SUMMARY"

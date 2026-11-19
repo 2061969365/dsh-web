@@ -3,7 +3,7 @@
 这里的脚本由 `.github/workflows/dsh-web.yml` 和 `dsh-stop.yml` 调用，负责两件事：
 
 1. **状态**：把 `DSH_HOME` / `DSH_WORKSPACE` 保存为私有 release 快照，并在下次运行时恢复。
-2. **进程**：启动 cloudflared 和 `dsh web`，发布访问 URL，监控磁盘/停止信号，结束时 final save。
+2. **进程**：启动 Caddy basic auth 代理和 `dsh web`，发布固定访问 URL，监控磁盘/停止信号，结束时 final save。
 
 面向使用者的安装步骤见 [../README.md](../README.md)。本文是实现契约和运维手册；接口以最终脚本为准。
 
@@ -15,7 +15,7 @@
 | --- | --- |
 | `state.sh` | `state` 分支、`dsh-state` release 快照、冷会话归档、锁、URL 发布、STOP 检查 |
 | `sync-excludes.txt` | home/work 共用的 rsync 排除规则，`state.sh` 唯一排除来源 |
-| `run.sh` | cloudflared + dsh + session archive agent supervisor、checkpoint、磁盘保护、优雅停止 |
+| `run.sh` | cloudflared + Caddy basic auth + dsh + session archive agent supervisor、checkpoint、磁盘保护、优雅停止 |
 | `session-archive-agent.mjs` | 冷会话归档的下载、sha256 校验、解压和替换 stub |
 | `tests/session-archive-test.sh` | `archive_cold_sessions` 的热/冷、stub、索引、复用逻辑测试 |
 | `tests/session-archive-agent-test.mjs` | agent 下载/校验/恢复的端到端测试（fake `gh`） |
@@ -36,19 +36,21 @@
 | `DSH_SCRATCH` | 自动选择 | 最大可写挂载点，优先 `/mnt`（必要时 `/mnt/dsh-scratch`） |
 | `TMPDIR`/`TMP`/`TEMP` | `$DSH_SCRATCH/dsh-tmp` | 临时文件 |
 | `STATE_CLONE` | `$DSH_SCRATCH/dsh-state` | 私有状态仓库临时克隆 |
-| `RUN_DIR` | `$DSH_SCRATCH/run` | 日志、`url.txt`、打包 staging |
+| `RUN_DIR` | `$DSH_SCRATCH/run` | 日志、`Caddyfile`、`url.txt`、打包 staging |
 
 scratch 选择规则：候选挂载点必须同时满足 **≥20GB 可用空间**和 **≥5% 可用 inode**；优先 `/mnt`，`/mnt` 不可写时尝试 `/mnt/dsh-scratch`，否则 `/home/runner`。都不满足时工作流失败，除非设置仓库变量 `DSH_ALLOW_SMALL_SCRATCH=true`（仅用于调试，5GB 状态可能写满根盘）。
 
 `RUN_DIR` 内主要有：
 
-- `dsh-web.log`（0600）：dsh 的 stdout/stderr，URL 令牌在写入前掩码。
+- `dsh-web.log`（0600）：dsh 的 stdout/stderr；dsh 会打印带 process token 的 URL，文件只在 runner 本地。
 - `cloudflared.log`（0600）：隧道日志。
+- `caddy.log`（0600）：Caddy 启动/校验/错误日志。
+- `Caddyfile`（0600）：Caddy basic auth 配置，含 bcrypt hash 和本次 dsh token；不进状态快照。
 - `state.log`（0600）：所有 `state.sh` 调用的输出。
 - `auto-restart.log`（0600）：自动重启 dispatch 的输出。
 - `session-archive.log`（0600）：归档 agent 的下载/恢复日志。
 - `session-archive.sock`（0600）：插件调用 agent 的本地 Unix socket。
-- `url.txt`（0600）：解析出的完整访问 URL。
+- `url.txt`（0600）：固定公开 URL，不含 token。
 - `meta.json`：若存在，`publish-url` 会同步到控制分支；常规情况下由 `save` 更新控制分支的 meta。
 - `state/`：`rsync` staging、冷归档临时文件和打包临时目录。
 
@@ -81,6 +83,12 @@ workflow 和脚本之间共享的变量：
 | `SESSION_ARCHIVE_TOKEN` | 无（可选 secret） | agent | 下载归档的只读 token；回退 `STATE_REPO_TOKEN` |
 | `DSH_DEBUG_LOG_TAIL` | `false` | `run.sh` | 启动失败时输出遮蔽 URL 的 dsh 日志尾部 |
 | `DSH_PUBLIC_HOST` | 无（必填 variable） | `run.sh` | `dsh --public-url/--trusted-host` |
+| `DSH_WEB_USER` | `dsh`（variable） | `run.sh` | Caddy basic auth 用户名 |
+| `DSH_WEB_PASSWORD` | 无（必填 secret） | `run.sh` | Caddy basic auth 密码；只用于生成 bcrypt hash，不写状态 |
+| `DSH_PORT` | `3081`（内部常量） | `run.sh` | dsh 只监听 loopback 3081 |
+| `CADDY_PORT` | `3080`（内部常量） | `run.sh` | Caddy 监听 loopback 3080；cloudflared origin |
+| `CADDY_VERSION` | 无（必填 variable） | workflow | Caddy 版本 |
+| `CADDY_SHA512` | 无（必填 variable） | workflow | Caddy tar.gz SHA-512 |
 | `DSH_VERSION` | 无（必填 variable） | workflow | 安装的 dsh 版本 |
 | `CLOUDFLARED_VERSION` | 无（必填 variable） | workflow | cloudflared 版本 |
 | `CLOUDFLARED_SHA256` | 无（必填 variable） | workflow | cloudflared 下载校验 |
@@ -133,7 +141,7 @@ state.sh status               # 输出紧凑 JSON（不含 URL/token）
 单条滚动提交，只放小文件，控制在 10MB 以内：
 
 ```text
-runtime/url.txt          当前完整访问 URL（0600，含访问令牌）
+runtime/url.txt          固定公开 URL（不含 token；Caddy 负责认证）
 runtime/meta.json        最近一次 save 的 raw_bytes/raw_mb/parts/scratch_free_mb/final
 runtime/lock.json        run_id、host、started、heartbeat（ISO 8601）
 runtime/state.json       当前快照：run_id、created、raw_bytes/raw_mb、home/work parts、archived
@@ -143,7 +151,7 @@ runtime/sessions-index.json 冷会话索引副本（来自 $DSH_HOME/.session-ar
 README.md
 ```
 
-`url.txt` 是访问凭据。分支虽然小，但历史里也会留下旧 URL，所以状态仓库必须始终 private；泄露后要轮换并清理。
+`url.txt` 现在只是固定公开地址，不再含 token；真正保护入口的是 `DSH_WEB_PASSWORD` 和 Caddy basic auth。状态仓库仍需 private，因为 `.credentials.yaml`、会话、附件和冷归档在里面。
 
 ### 3.3 release 与快照命名
 
@@ -197,11 +205,12 @@ session-<session_id>-<sha16>.tar.zst
 
 ### 3.6 `publish-url`
 
-- 默认**不带参数**：从 `$RUN_DIR/url.txt` 读取 URL（`run.sh` 已先以 0600 写入），再写入控制分支的 `runtime/url.txt`（0600）。
+- 默认**不带参数**：从 `$RUN_DIR/url.txt` 读取固定公开 URL（`run.sh` 已先以 0600 写入），再写入控制分支的 `runtime/url.txt`（0600）。
+- `run.sh` 发布的是 `https://$DSH_PUBLIC_HOST/`，不含 dsh token；token 只存在于 runner 的 `Caddyfile`（0600）。
 - `meta.json` 由 `init` / `save` 更新；`publish-url` 不改写它。
-- 可选 `<url>` 参数只用于手动/调试；自动流程不要使用，避免完整 URL（含令牌）进入 argv 和进程列表。
+- 可选 `<url>` 参数只用于手动/调试；自动流程不要使用。
 - 提交并推送 `state` 分支。
-- 不在 stdout、job summary 或公开日志中打印 URL；URL 仅出现在 dsh 进程自身的 0600 日志（本地 scratch，不上传）和私有 `runtime/url.txt` 中；`run.sh` 负责写入文件并只显示掩码版本。
+- 不在 stdout、job summary 或公开日志中打印 URL；dsh 自身仍会在 `$DSH_LOG` 打印带 token 的 URL，该文件只在 runner 本地 scratch（0600），不上传。
 
 ### 3.7 `should-stop`
 
@@ -242,7 +251,7 @@ gh api "repos/$STATE/contents/runtime/lock.json?ref=state" --jq .content | base6
 GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --jq .value
 ```
 
-不要用 `cat`/日志打印 `runtime/url.txt`；需要访问时在浏览器打开私有仓库文件。
+不要用 `cat`/日志打印 `Caddyfile`；它含 dsh token 和密码 hash。访问入口是固定公开 URL + `DSH_WEB_PASSWORD`，不需要读 `runtime/url.txt`。
 
 ### 3.11 恢复与清理场景
 
@@ -271,7 +280,7 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
 ### 4.1 启动顺序
 
-1. 校验 `DSH_HOME`/`DSH_WORKSPACE`/`RUN_DIR`/`STATE_*`，设置 `umask 077`，确认 `state.sh init` 已成功。
+1. 校验 `DSH_HOME`/`DSH_WORKSPACE`/`RUN_DIR`/`STATE_*`/`DSH_WEB_PASSWORD`，设置 `umask 077`，确认 `state.sh init` 已成功。
 2. 准备冷归档：
    - 如果 profile 还没有 `@dsh-web/session-archive` 依赖，执行 `dsh plugin --profile web add file:<checkout>/dsh-session-archive`；
    - `restore_profile_plugins` 执行 `dsh plugin --profile web install`，重建 `node_modules`；
@@ -292,23 +301,23 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
    ```bash
    env -u STATE_REPO_TOKEN -u SESSION_ARCHIVE_TOKEN -u CF_TUNNEL_TOKEN \
-     -u GH_TOKEN -u GITHUB_TOKEN -u DSH_NOTIFY_WEBHOOK \
+     -u GH_TOKEN -u GITHUB_TOKEN -u DSH_NOTIFY_WEBHOOK -u DSH_WEB_PASSWORD \
      DSH_SESSION_ARCHIVE_SOCKET="$RUN_DIR/session-archive.sock" \
      dsh --patch "$DSH_HOME/profiles/web/session-archive.overlay.yml" \
-     --profile web --host 127.0.0.1 --port 3080 --no-open \
+     --profile web --host 127.0.0.1 --port 3081 --no-open \
      --public-url "https://$DSH_PUBLIC_HOST/" --trusted-host "$DSH_PUBLIC_HOST"
    ```
 
-   `--patch` 必须放在 `--profile` 前；overlay 放在 profile 目录旁，插件按 profile 的 `node_modules` 解析。`DEEPSEEK_API_KEY` / `DEEP_API_KEY` 保留给模型 provider；workflow 会把 `DEEPSEEK_API_KEY` secret 同时映射到这两个变量。其余仓库/隧道/归档令牌全部剥离。
+   `--patch` 必须放在 `--profile` 前；overlay 放在 profile 目录旁，插件按 profile 的 `node_modules` 解析。`DEEPSEEK_API_KEY` / `DEEP_API_KEY` 保留给模型 provider；workflow 会把 `DEEPSEEK_API_KEY` secret 同时映射到这两个变量。其余仓库/隧道/归档/网页密码全部剥离。
 
-5. 从 dsh 输出解析 `dsh web:` 行中的完整 URL（含访问令牌），**原始 URL** 写入 `RUN_DIR/url.txt`（0600），日志/终端只显示掩码版本，再调用**不带参数**的 `state.sh publish-url`；脚本从该文件读取 URL，避免令牌进入 argv。
-6. 进入监控循环；完整 URL 只出现在私有 `runtime/url.txt` 和本地 0600 日志中。
+5. 从 dsh 输出解析 `dsh web:` 行，提取本次 process token；用 `caddy hash-password` 生成密码 hash，写入 0600 的 `Caddyfile`，启动 Caddy（127.0.0.1:3080，basic auth，反代 127.0.0.1:3081，`uri query token <token>`）。Caddy 就绪后把固定 `https://$DSH_PUBLIC_HOST/` 写入 `RUN_DIR/url.txt`，再调用**不带参数**的 `state.sh publish-url`。
+6. 进入监控循环；token 只存在于 runner 的 `Caddyfile` 和 dsh 自身 0600 日志中，公开状态只保存固定 URL。
 
 ### 4.2 监控循环
 
 | 周期 | 动作 |
 | --- | --- |
-| 10 秒 | `state.sh should-stop`；检查 dsh / cloudflared 存活 |
+| 10 秒 | `state.sh should-stop`；检查 dsh / cloudflared / Caddy 存活 |
 | 30 秒 | `df` 采样 `/` 和 `$DSH_SCRATCH` 的可用 MB 与 inode |
 | checkpoint（10/20 分钟） | `state.sh save`；统计 `$TMPDIR`；必要时清理旧 subprocess 日志 |
 | 330 分钟 | 正常 deadline，进入停止流程 |
@@ -326,11 +335,12 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
 1. 向 dsh 发送 SIGTERM，最多等待 `DSH_STOP_GRACE_SEC`（默认 120 秒），仍未退出则 SIGKILL。
 2. 停止 cloudflared，最多等待 `DSH_CFD_STOP_GRACE_SEC`（默认 30 秒）。
-3. 清理 `$TMPDIR` 下的 DSH 临时目录；**不清理** `$DSH_HOME/spill`。
-4. `state.sh save --final`。
-5. `state.sh release-lock`。
-6. 停止 session archive agent 并删除 socket。
-7. 输出公开 summary（无 URL/token，只说明 URL 位于私有 `runtime/url.txt`）。
+3. 停止 Caddy，最多等待 `DSH_CFD_STOP_GRACE_SEC`。
+4. 清理 `$TMPDIR` 下的 DSH 临时目录；**不清理** `$DSH_HOME/spill`。
+5. `state.sh save --final`。
+6. `state.sh release-lock`。
+7. 停止 session archive agent 并删除 socket。
+8. 输出公开 summary（不打印密码、token 或 `Caddyfile`；公开 URL 固定，不含 token）。
 
 正常停止通常 1–3 分钟。不要在 job 还在 final save 时手动 `cancel`。
 
@@ -345,12 +355,12 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 - `GITHUB_REPOSITORY`、`GITHUB_REF_NAME`、`GITHUB_TOKEN` 都存在，且 runner 上有 `gh`；
 - `GITHUB_TOKEN` 具备 `actions: write`。
 
-触发方式是用 `gh workflow run dsh-web.yml` 重新 dispatch（带 `--ref`），并传入 `restarts_left - 1`。`concurrency: dsh-web` + `cancel-in-progress: false` 保证新 run 排队而不是与旧 run 并行。新 run 会生成新 URL，用户必须重新打开 `runtime/url.txt`。dispatch 失败只记录在 `auto-restart.log`，不会让当前运行失败。
+触发方式是用 `gh workflow run dsh-web.yml` 重新 dispatch（带 `--ref`），并传入 `restarts_left - 1`。`concurrency: dsh-web` + `cancel-in-progress: false` 保证新 run 排队而不是与旧 run 并行。新 run 会生成新的 dsh token，但 Caddy 会重新注入；**公开 URL 和密码不变**，不需要重新复制。dispatch 失败只记录在 `auto-restart.log`，不会让当前运行失败。
 
 ### 4.5 日志与掩码
 
-- `$RUN_DIR/dsh-web.log`、`$RUN_DIR/cloudflared.log`、`$RUN_DIR/state.log`、`$RUN_DIR/auto-restart.log`、`$RUN_DIR/session-archive.log`、`$RUN_DIR/url.txt` 都是 0600；`session-archive.sock` 是 0600。
-- dsh URL 在 GitHub Actions 里额外用 `::add-mask::` 注册；日志里只出现阶段信息，不出现完整 URL。
+- `$RUN_DIR/dsh-web.log`、`$RUN_DIR/cloudflared.log`、`$RUN_DIR/caddy.log`、`$RUN_DIR/Caddyfile`、`$RUN_DIR/state.log`、`$RUN_DIR/auto-restart.log`、`$RUN_DIR/session-archive.log`、`$RUN_DIR/url.txt` 都是 0600；`session-archive.sock` 是 0600。
+- `Caddyfile` 含 dsh token 和密码 bcrypt hash，只在 runner 本地；`url.txt` 不含 token。
 - 不使用 `set -x`；错误处理里也不 `echo` 环境变量。
 - 启动失败时，可选 `DSH_DEBUG_LOG_TAIL=true` 打印 dsh 日志尾部；URL 会被正则遮蔽，默认关闭，避免把 session 内容带进公开 job log。
 - 工作流不上传 artifacts，避免日志/状态泄露。
@@ -369,11 +379,11 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 - `runs-on: ubuntu-24.04`；`timeout-minutes: 355`。
 - `permissions: contents: read, actions: write`。
 - `concurrency: {group: dsh-web, cancel-in-progress: false}`。
-- Preflight 要求以下仓库变量非空：`STATE_REPO`、`DSH_PUBLIC_HOST`、`DSH_VERSION`、`CLOUDFLARED_VERSION`、`CLOUDFLARED_SHA256`、`GITLEAKS_VERSION`、`GITLEAKS_SHA256`；并要求 `STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN` 两个 secret。`SESSION_ARCHIVE_TOKEN` 可选，存在时会掩码。
-- Node 24 + npm cache；安装 dsh、pnpm，下载 cloudflared/gitleaks 并按 64 位 hex SHA-256 校验。
+- Preflight 要求以下仓库变量非空：`STATE_REPO`、`DSH_PUBLIC_HOST`、`DSH_VERSION`、`CLOUDFLARED_VERSION`、`CLOUDFLARED_SHA256`、`GITLEAKS_VERSION`、`GITLEAKS_SHA256`、`CADDY_VERSION`、`CADDY_SHA512`；并要求 `STATE_REPO_TOKEN`、`CF_TUNNEL_TOKEN`、`DSH_WEB_PASSWORD` 三个 secret。`SESSION_ARCHIVE_TOKEN` 可选，存在时会掩码。
+- Node 24 + npm cache；安装 dsh、pnpm，下载 cloudflared/gitleaks/Caddy；cloudflared/gitleaks 校验 SHA-256，Caddy 校验 SHA-512。
 - 选择 scratch（≥20GB、inode ≥5%；`/mnt` → `/mnt/dsh-scratch` → `/home/runner`）并导出 `DSH_SCRATCH`/`DSH_HOME`/`DSH_WORKSPACE`/`TMPDIR`/`STATE_CLONE`/`RUN_DIR`；`DSH_ALLOW_SMALL_SCRATCH=true` 可覆盖 20GB 要求。
-- `state.sh init` 超时 10 分钟；`run.sh` 用 `timeout --signal=TERM --kill-after=180s 20700` 包裹（345 分钟）；最后生成不含 URL 的公开 summary。
-- `run.sh` 会安装本地 host 插件和 overlay、启动 archive agent，并以 `dsh --patch ... --profile web` 启动；插件不可用时自动关闭本次归档。
+- `state.sh init` 超时 10 分钟；`run.sh` 用 `timeout --signal=TERM --kill-after=180s 20700` 包裹（345 分钟）；最后生成不含密码/token 的公开 summary。
+- `run.sh` 会安装本地 host 插件和 overlay、启动 archive agent，并以 `dsh --patch ... --profile web` 启动；插件不可用时自动关闭本次归档。dsh 监听 3081，Caddy basic auth 监听 3080。
 
 ### 5.2 `dsh-stop.yml`
 
@@ -390,6 +400,7 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 | --- | --- | --- | --- |
 | `STATE_REPO_TOKEN` | secret | 公共仓库 | `state.sh`、`dsh-stop` |
 | `CF_TUNNEL_TOKEN` | secret | 公共仓库 | `run.sh` → cloudflared |
+| `DSH_WEB_PASSWORD` | secret（必填） | 公共仓库 | `run.sh` → Caddy basic auth |
 | `DEEPSEEK_API_KEY` | secret（可选） | 公共仓库 | `run.sh` → dsh |
 | `SESSION_ARCHIVE_TOKEN` | secret（可选） | 公共仓库 | session archive agent |
 | `DSH_NOTIFY_WEBHOOK` | secret（可选） | 公共仓库 | 预留通知 |
@@ -398,6 +409,8 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 | `DSH_VERSION` | variable（必填） | 公共仓库 | 安装步骤 |
 | `CLOUDFLARED_VERSION` / `CLOUDFLARED_SHA256` | variable（必填） | 公共仓库 | 安装/校验 |
 | `GITLEAKS_VERSION` / `GITLEAKS_SHA256` | variable（必填） | 公共仓库 | 安装/校验 |
+| `CADDY_VERSION` / `CADDY_SHA512` | variable（必填） | 公共仓库 | Caddy 安装/校验 |
+| `DSH_WEB_USER` | variable | 公共仓库 | Caddy 用户名（默认 `dsh`） |
 | `STATE_*` | variable | 公共仓库 | `state.sh` |
 | `DSH_PERSIST_CREDENTIALS` | variable | 公共仓库 | `state.sh` |
 | `SESSION_ARCHIVE_ENABLED` / `SESSION_HOT_MAX` / `SESSION_HOT_DAYS` / `SESSION_ARCHIVE_MIN_AGE_SEC` | variable | 公共仓库 | `state.sh`、`run.sh` |
@@ -413,16 +426,17 @@ GH_TOKEN="$STATE_REPO_TOKEN" gh api "repos/$STATE/actions/variables/DSH_STOP" --
 
 - 脚本 `set -euo pipefail`，**没有** `set -x`。
 - `umask 077`；敏感文件 0600。
-- token 只通过环境变量/`GIT_ASKPASS` 传递，不进入 git remote URL、argv、stdout、日志、summary 或 artifacts。
-- 访问 URL 由 `run.sh` 写入 `$RUN_DIR/url.txt`（0600），`state.sh publish-url` **无参数**从文件读取；`<url>` 参数只允许手动调试，自动流程禁用。
+- token/密码只通过环境变量/stdin/`GIT_ASKPASS` 传递，不进入 git remote URL、argv、stdout、日志、summary 或 artifacts。`caddy hash-password` 从 stdin 读取密码。
+- 访问 URL 由 `run.sh` 写入 `$RUN_DIR/url.txt`（0600），`state.sh publish-url` **无参数**从文件读取；现在写的是固定公开 URL，不含 dsh token。
+- `Caddyfile` 含 dsh token 和 bcrypt hash，写入 `$RUN_DIR` 并 chmod 0600；不进状态快照。
 - `gh` 命令使用 `--repo "$STATE_REPO"` + `GH_TOKEN`，不把 token 拼进 remote URL。
 - `state.sh init` 强制检查状态仓库为 private。
 - 上传前 gitleaks 扫描；命中阻止保存并使本次运行以 exit 5 停止。唯一放行的是 `DSH_PERSIST_CREDENTIALS=true` 时的 `$DSH_HOME/.credentials.yaml`；冷会话日志在归档前仍会被扫描。
-- dsh 进程用 `env -u` 剥离 `STATE_REPO_TOKEN`、`SESSION_ARCHIVE_TOKEN`、`CF_TUNNEL_TOKEN`、`GH_TOKEN`、`GITHUB_TOKEN`；cloudflared 启动后立即 unset `CF_TUNNEL_TOKEN`。归档 token 只存在于 agent 进程。
+- dsh 进程用 `env -u` 剥离 `STATE_REPO_TOKEN`、`SESSION_ARCHIVE_TOKEN`、`CF_TUNNEL_TOKEN`、`DSH_WEB_PASSWORD`、`GH_TOKEN`、`GITHUB_TOKEN`；cloudflared 启动后立即 unset `CF_TUNNEL_TOKEN`。归档 token 只存在于 agent 进程。
 - `.credentials.yaml` 在私有状态仓库中是明文；能读仓库或 token 的人就能读模型 key。该文件恢复后 chmod 0600。
 - 冷会话归档 asset 也在私有状态仓库；读权限等同于读完整会话历史。
-- 公共 summary 只说明 URL 位于私有 `runtime/url.txt`，绝不打印 URL。
-- 工作流不上传 artifacts；日志和 `url.txt` 都是 0600。`DSH_DEBUG_LOG_TAIL` 默认关闭，开启时遮蔽 URL。
+- 公共 summary 只说明固定公开地址和密码保护，不打印密码、token 或 `Caddyfile`。
+- 工作流不上传 artifacts；日志、`Caddyfile` 和 `url.txt` 都是 0600。`DSH_DEBUG_LOG_TAIL` 默认关闭，开启时遮蔽 URL。
 
 ## 7. 验收与自检
 
@@ -461,9 +475,11 @@ grep -n 'publish-url' dsh-actions/run.sh dsh-actions/state.sh
 - 插件未就绪时 `run.sh` 强制关闭归档，不产生新 stub。
 - `status` 返回含 `raw_mb` 的 JSON，`run.sh` 能据此切换 20 分钟 checkpoint。
 - `DSH_STOP` 等于 run id / `all` 时 `should-stop` 返回 0。
-- `publish-url` 无参数时从 `$RUN_DIR/url.txt` 读取；URL 不出现在 argv、公开日志或 summary 中。
-- `run.sh` 能启动/停止两个进程、解析并掩码 URL、执行 checkpoint、响应磁盘阈值、SIGTERM 后 final save、释放锁。
-- 自动重启只在正常 deadline 且 final save/lock 成功时发生；STOP/磁盘/崩溃不重启。
+- `publish-url` 无参数时从 `$RUN_DIR/url.txt` 读取固定公开 URL；密码/token 不出现在 argv、公开日志或 summary 中。
+- `run.sh` 能启动/停止 dsh、cloudflared、Caddy 三个进程；Caddy 用 basic auth 保护 3080，把 token 注入 3081；无密码返回 401，密码正确返回 200。
+- Caddyfile 校验通过；密码 hash 是 bcrypt；`DSH_WEB_PASSWORD` 变化后重启能生效。
+- `run.sh` 执行 checkpoint、响应磁盘阈值、SIGTERM 后 final save、释放锁。
+- 自动重启只在正常 deadline 且 final save/lock 成功时发生；STOP/磁盘/崩溃不重启；重启后公开 URL 和密码不变。
 - 两个 workflow 使用的 secret/variable 名称与本文件、`../README.md` 一致；preflight 要求的版本/SHA 变量齐全。
 
 ## 8. 文档与脚本的一致性

@@ -20,6 +20,10 @@ die() { log "error: $*"; exit 1; }
 : "${STATE_REPO:?STATE_REPO must be set}"
 : "${STATE_REPO_TOKEN:?STATE_REPO_TOKEN must be set}"
 : "${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN must be set}"
+: "${DSH_WEB_PASSWORD:?DSH_WEB_PASSWORD must be set}"
+
+DSH_WEB_USER="${DSH_WEB_USER:-dsh}"
+[[ "$DSH_WEB_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "DSH_WEB_USER contains unsupported characters"
 
 DSH_PUBLIC_HOST="${DSH_PUBLIC_HOST%/}"
 [[ -n "$DSH_PUBLIC_HOST" ]] || die "DSH_PUBLIC_HOST is empty"
@@ -70,6 +74,11 @@ readonly URL_FILE="$RUN_DIR/url.txt"
 readonly AUTO_RESTART_LOG="$RUN_DIR/auto-restart.log"
 readonly ARCHIVE_LOG="$RUN_DIR/session-archive.log"
 readonly ARCHIVE_SOCKET="$RUN_DIR/session-archive.sock"
+readonly CADDY_LOG="$RUN_DIR/caddy.log"
+readonly CADDYFILE="$RUN_DIR/Caddyfile"
+
+readonly DSH_PORT=3081
+readonly CADDY_PORT=3080
 
 STARTED_AT="$(date +%s)"
 DEADLINE_EPOCH=$(( STARTED_AT + MAX_RUNTIME_MIN * 60 ))
@@ -83,10 +92,12 @@ CLEANUP_DONE=0
 
 DSH_PID=""
 CFD_PID=""
+CADDY_PID=""
 ARCHIVE_PID=""
 ARCHIVE_READY=false
 ARCHIVE_OVERLAY=""
 DSH_URL=""
+DSH_TOKEN=""
 
 CHECKPOINT_EVERY_MIN="$CHECKPOINT_BASE_MIN"
 CHECKPOINT_COUNT=0
@@ -435,7 +446,7 @@ start_dsh() {
   else
     warn "session archive plugin is not ready; starting without the overlay"
   fi
-  dsh_args+=(--profile web --host 127.0.0.1 --port 3080 --no-open
+  dsh_args+=(--profile web --host 127.0.0.1 --port "$DSH_PORT" --no-open
     --public-url "https://$DSH_PUBLIC_HOST/"
     --trusted-host "$DSH_PUBLIC_HOST")
   log "starting dsh web"
@@ -447,6 +458,68 @@ start_dsh() {
       "${dsh_args[@]}"
   ) >>"$DSH_LOG" 2>&1 &
   DSH_PID=$!
+}
+
+dsh_url_token() {
+  local url="${1:-}" query part
+  local -a parts=()
+  [[ "$url" == *\?* ]] || return 1
+  query="${url#*\?}"
+  IFS='&' read -r -a parts <<< "$query"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == token=* ]]; then
+      printf '%s' "${part#token=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_caddy() {
+  local token hash="" waited=0
+  command -v caddy >/dev/null 2>&1 || { warn "caddy is not on PATH"; return 1; }
+  command -v curl >/dev/null 2>&1 || { warn "curl is not on PATH"; return 1; }
+  token="$(dsh_url_token "$DSH_URL")" || { warn "could not extract the dsh access token"; return 1; }
+  [[ -n "$token" ]] || { warn "the dsh access token is empty"; return 1; }
+  [[ "$token" != *[[:space:]]* && "$token" != *'"'* && "$token" != *'{'* && "$token" != *'}'* ]] \
+    || { warn "the dsh access token contains unsupported characters"; return 1; }
+  [[ "$token" != *'&'* && "$token" != *'#'* && "$token" != *'%'* && "$token" != *'?'* ]] \
+    || { warn "the dsh access token contains query-unsafe characters"; return 1; }
+  hash="$(printf '%s' "$DSH_WEB_PASSWORD" | caddy hash-password 2>/dev/null)" \
+    || { warn "could not hash DSH_WEB_PASSWORD"; return 1; }
+  [[ "$hash" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] \
+    || { warn "unexpected caddy password hash format"; return 1; }
+
+  : > "$CADDY_LOG"
+  chmod 600 -- "$CADDY_LOG" 2>/dev/null || true
+  printf '{\n\tadmin off\n}\n\n:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\turi query token %s\n\treverse_proxy 127.0.0.1:%s {\n\t\tflush_interval -1\n\t}\n}\n' \
+    "$CADDY_PORT" "$DSH_WEB_USER" "$hash" "$token" "$DSH_PORT" > "$CADDYFILE"
+  chmod 600 -- "$CADDYFILE" 2>/dev/null || true
+
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >>"$CADDY_LOG" 2>&1; then
+    warn "caddy rejected the generated Caddyfile; see $CADDY_LOG"
+    return 1
+  fi
+
+  log "starting caddy auth proxy on 127.0.0.1:$CADDY_PORT"
+  caddy run --config "$CADDYFILE" --adapter caddyfile >>"$CADDY_LOG" 2>&1 &
+  CADDY_PID=$!
+  while (( waited < 40 )); do
+    if ! process_alive "$CADDY_PID"; then
+      warn "caddy exited during startup; see $CADDY_LOG"
+      CADDY_PID=""
+      return 1
+    fi
+    if curl -fsS --max-time 2 -u "$DSH_WEB_USER:$DSH_WEB_PASSWORD" \
+         "http://127.0.0.1:$CADDY_PORT/" >/dev/null 2>&1; then
+      log "caddy auth proxy is ready"
+      return 0
+    fi
+    sleep 0.5 || true
+    waited=$(( waited + 1 ))
+  done
+  warn "caddy did not become ready; see $CADDY_LOG"
+  return 1
 }
 
 checkpoint() {
@@ -546,6 +619,14 @@ run_loop() {
       CFD_PID=""
       warn "cloudflared exited unexpectedly (rc=$rc); see $CFD_LOG"
       STOP_REASON="cloudflared-exited"
+      EXIT_CODE=1
+      return 0
+    fi
+    if ! process_alive "$CADDY_PID"; then
+      wait "$CADDY_PID" 2>/dev/null || rc=$?
+      CADDY_PID=""
+      warn "caddy exited unexpectedly (rc=$rc); see $CADDY_LOG"
+      STOP_REASON="caddy-exited"
       EXIT_CODE=1
       return 0
     fi
@@ -659,6 +740,8 @@ cleanup() {
   DSH_PID=""
   terminate_process "${CFD_PID:-}" "$CFD_STOP_GRACE_SEC" "cloudflared"
   CFD_PID=""
+  terminate_process "${CADDY_PID:-}" "$CFD_STOP_GRACE_SEC" "caddy"
+  CADDY_PID=""
   cleanup_tmp_scratch
   if [[ -f "$STATE_SH" ]]; then
     log "final state save"
@@ -718,7 +801,8 @@ main() {
   : > "$STATE_LOG"
   : > "$AUTO_RESTART_LOG"
   : > "$ARCHIVE_LOG"
-  chmod 600 -- "$DSH_LOG" "$CFD_LOG" "$STATE_LOG" "$AUTO_RESTART_LOG" "$ARCHIVE_LOG" 2>/dev/null || true
+  : > "$CADDY_LOG"
+  chmod 600 -- "$DSH_LOG" "$CFD_LOG" "$STATE_LOG" "$AUTO_RESTART_LOG" "$ARCHIVE_LOG" "$CADDY_LOG" 2>/dev/null || true
 
   if [[ -z "${TMPDIR:-}" ]]; then
     TMPDIR="$DSH_SCRATCH/dsh-tmp"
@@ -759,12 +843,22 @@ main() {
     EXIT_CODE=1
     return 0
   fi
-  if ! publish_url "$DSH_URL"; then
+  DSH_TOKEN="$(dsh_url_token "$DSH_URL")" || {
+    STOP_REASON="startup-failed"
+    EXIT_CODE=1
+    return 0
+  }
+  if ! start_caddy; then
+    STOP_REASON="caddy-startup"
+    EXIT_CODE=1
+    return 0
+  fi
+  if ! publish_url "https://$DSH_PUBLIC_HOST/"; then
     STOP_REASON="publish-failed"
     EXIT_CODE=1
     return 0
   fi
-  log "dsh web is up; supervisor loop started"
+  log "dsh web is up behind caddy; supervisor loop started"
   run_loop
 }
 

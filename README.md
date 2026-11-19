@@ -33,7 +33,9 @@ GitHub Actions (ubuntu-24.04)
 │    └─ 冷会话打开时从 release 下载归档、校验 sha256、解压恢复
 ├─ cloudflared（出站连接，使用 Named Tunnel Token）
 │    └─ Cloudflare 边缘 ──> https://<DSH_PUBLIC_HOST>
-└─ dsh web 监听 127.0.0.1:3080
+├─ Caddy basic auth（127.0.0.1:3080，用户名/密码）
+│    └─ 注入本次 dsh process token，反代到 127.0.0.1:3081
+└─ dsh web 监听 127.0.0.1:3081
      ├─ host 插件 @dsh-web/session-archive 在 sessionPersistence.open 前调用 agent
      ├─ 每 10/20 分钟 checkpoint：打包、上传、更新 state 分支
      └─ 结束前 final save，然后释放锁
@@ -43,7 +45,8 @@ GitHub Actions (ubuntu-24.04)
 - **私有状态仓库**：`2061969365/dsh-web-state`，必须保持 private。
 - **`state` 分支**：单条滚动提交，保存 `runtime/url.txt`、`runtime/meta.json`、`runtime/state.json`、`runtime/state.prev.json`、`runtime/sessions-index.json`、`runtime/lock.json` 等小文件。
 - **`dsh-state` release**：保存 `home-<run_id>-<ts>.tar.zst.part-NN`、`work-<run_id>-<ts>.tar.zst.part-NN` 快照分卷，以及冷会话归档 `session-<id>-<sha16>.tar.zst`。默认只保留最近 **2** 份快照（`STATE_KEEP_SNAPSHOTS` 可增大）；冷会话归档不参与这份快照清理，会一直保留。
-- **Named Tunnel**：Cloudflare 控制台里把 Public Hostname 指向 `http://127.0.0.1:3080`；runner 不需要开放入站端口。
+- **Named Tunnel**：Cloudflare 控制台里把 Public Hostname 指向 `http://127.0.0.1:3080`（Caddy）；runner 不需要开放入站端口。
+- **Caddy**：basic auth 入口，默认用户名 `dsh`，密码来自 `DSH_WEB_PASSWORD`；dsh 只监听 127.0.0.1:3081，token 由 Caddy 内部注入。
 - **Runner**：`ubuntu-24.04`，工作流 job 超时 355 分钟，其中初始化 10 分钟、主程序最多 345 分钟。
 
 ## 2. 关键限制
@@ -126,6 +129,7 @@ Metadata 权限会自动包含。不要给这个 PAT 访问公共仓库或其他
 ```bash
 gh secret set STATE_REPO_TOKEN --repo "$REPO"   # 3.4 创建的 PAT
 gh secret set CF_TUNNEL_TOKEN --repo "$REPO"    # 3.7 的 Named Tunnel Token
+gh secret set DSH_WEB_PASSWORD --repo "$REPO"   # 网页登录密码，必需
 gh secret set DEEPSEEK_API_KEY --repo "$REPO"   # 可选，建议设置
 gh secret set SESSION_ARCHIVE_TOKEN --repo "$REPO" # 可选，冷会话归档的只读 token
 gh secret set DSH_NOTIFY_WEBHOOK --repo "$REPO" # 可选，预留通知 webhook
@@ -135,6 +139,7 @@ gh secret set DSH_NOTIFY_WEBHOOK --repo "$REPO" # 可选，预留通知 webhook
 | --- | --- | --- |
 | `STATE_REPO_TOKEN` | 是 | 读写私有状态仓库（控制分支 + release assets） |
 | `CF_TUNNEL_TOKEN` | 是 | cloudflared 连接 Named Tunnel |
+| `DSH_WEB_PASSWORD` | 是 | 网页 basic auth 密码；Caddy 用它保护入口，不写进状态 |
 | `DEEPSEEK_API_KEY` | 否 | 注入 dsh 进程的模型 key；不写盘、不打印。不设置时可在页面填写并依赖 `.credentials.yaml` 持久化 |
 | `SESSION_ARCHIVE_TOKEN` | 否 | 冷会话 agent 下载归档用的只读 token；不设置时回退到 `STATE_REPO_TOKEN` |
 | `DSH_NOTIFY_WEBHOOK` | 否 | 预留通知 webhook（当前 workflow 只做掩码，未实际发送） |
@@ -157,6 +162,12 @@ gh variable set CLOUDFLARED_VERSION --repo "$REPO" --body "<cloudflared-version>
 gh variable set CLOUDFLARED_SHA256 --repo "$REPO" --body "<cloudflared-sha256>"
 gh variable set GITLEAKS_VERSION --repo "$REPO" --body "<gitleaks-version>"
 gh variable set GITLEAKS_SHA256 --repo "$REPO" --body "<gitleaks-sha256>"
+
+# 必填：Caddy basic auth 代理（固定版本 + 128 位 SHA-512）
+gh variable set CADDY_VERSION --repo "$REPO" --body "2.11.9"
+gh variable set CADDY_SHA512 --repo "$REPO" --body "<caddy-tarball-sha512>"
+# 可选：登录用户名（默认 dsh）
+gh variable set DSH_WEB_USER --repo "$REPO" --body "dsh"
 
 gh variable set STATE_BUDGET_MB --repo "$REPO" --body "5120"
 gh variable set STATE_WARN_MB --repo "$REPO" --body "3072"
@@ -195,6 +206,9 @@ sha256sum cloudflared-linux-amd64
 | `CLOUDFLARED_SHA256` | 无（必填） | cloudflared 二进制 SHA-256 |
 | `GITLEAKS_VERSION` | 无（必填） | 状态扫描工具版本 |
 | `GITLEAKS_SHA256` | 无（必填） | gitleaks 压缩包 SHA-256 |
+| `CADDY_VERSION` | 无（必填，常用 `2.11.9`） | Caddy 版本；用于 basic auth 反向代理 |
+| `CADDY_SHA512` | 无（必填） | Caddy Linux amd64 tar.gz 的 SHA-512 |
+| `DSH_WEB_USER` | `dsh` | 网页登录用户名 |
 | `STATE_BUDGET_MB` | `5120` | 原始状态硬上限 |
 | `STATE_WARN_MB` | `3072` | 软告警阈值 |
 | `STATE_ASSET_PART_MB` | `1900` | 分卷大小 |
@@ -219,9 +233,9 @@ sha256sum cloudflared-linux-amd64
    - Subdomain：`dsh`（或你喜欢的子域）
    - Domain：你的域名
    - Path：留空
-   - Service：**HTTP** → `127.0.0.1:3080`
+   - Service：**HTTP** → `127.0.0.1:3080`（Caddy basic auth 入口；dsh 在 3081）
 4. 把 token 放进 `CF_TUNNEL_TOKEN` secret（见 3.5）。
-5. 可选但推荐：Zero Trust → **Access → Applications → Add an application → Self-hosted**，保护同一个 hostname，策略用邮箱一次性验证码或 allow list。Access 会在 dsh 前面多一层登录，URL 即使泄露也进不来。
+5. 可选但推荐：Zero Trust → **Access → Applications → Add an application → Self-hosted**，保护同一个 hostname，策略用邮箱一次性验证码或 allow list。这样在 Caddy 密码之外还有一层身份验证。
 
 不需要在 runner 上放 `config.yml`，也不需要本地运行 `cloudflared`；路由由控制台的 Public Hostname 决定。
 
@@ -258,18 +272,17 @@ gh run watch --repo "$REPO" <run-id>
 首次运行会：
 
 1. 选择 scratch 挂载点（优先 `/mnt`，不可写时尝试 `/mnt/dsh-scratch`，需 ≥20GB 且 inode ≥5%），设置 `TMPDIR` 等路径。
-2. 安装固定版本的 dsh、cloudflared、gitleaks，并校验后两者的 SHA-256。
+2. 安装固定版本的 dsh、cloudflared、gitleaks、Caddy，并校验下载文件的 SHA-256/SHA-512。
 3. `state.sh init`：没有快照时从空状态开始；有快照时校验并恢复。
-4. 启动 cloudflared 和 `dsh web`，解析出带令牌的访问 URL。
-5. URL 的持久位置只有私有状态仓库的 `runtime/url.txt`（由私有仓库保护；git 只记录 0644，`publish-url` 在本地 clone 中重写为 0600）；runner 本地的 `RUN_DIR/url.txt` 是临时文件。
+4. 启动 `dsh web`（127.0.0.1:3081），解析它的 process token，再启动 Caddy basic auth 代理（127.0.0.1:3080），由 Caddy 把 token 注入上游；最后启动 cloudflared。
+5. 公开地址固定为 `https://$DSH_PUBLIC_HOST/`，浏览器会弹出 basic auth，用户名默认 `dsh`，密码是 `DSH_WEB_PASSWORD` secret。`runtime/url.txt` 只保存这个固定 URL，不再包含 token。
 6. 之后每 10/20 分钟 checkpoint。
 
-**取 URL**（私有仓库，需已登录且有权限）：
+**打开**：
 
-- 打开 <https://github.com/2061969365/dsh-web-state/blob/state/runtime/url.txt>
-- 或：私人状态仓库 → 分支 `state` → `runtime/url.txt`
-
-启动通常需要 2–5 分钟。URL 是**访问凭据**，不要粘贴到 issue、聊天或日志里。
+- 直接访问 `https://<DSH_PUBLIC_HOST>/`，输入用户名和 `DSH_WEB_PASSWORD`；不需要再读 `runtime/url.txt`。
+- dsh 的 access token 每次运行都会换，但只存在于 runner 内部的 Caddy 配置中；Caddy 每次启动重新读取，你不需要复制。
+- `runtime/url.txt` 仍会更新，便于确认当前公开地址；它不是密码。
 
 ## 5. 日常使用
 
@@ -281,8 +294,8 @@ gh run watch --repo "$REPO" <run-id>
 
 ### 打开与重开
 
-- 直接打开 `runtime/url.txt` 里的完整 URL。
-- 每次运行（包括自动重启）都会生成新的 URL 和新的 cookie 签名 secret：**重启后必须重新打开新 URL**，旧 URL/旧会话会失效。
+- 直接打开 `https://<DSH_PUBLIC_HOST>/`，输入用户名（默认 `dsh`）和 `DSH_WEB_PASSWORD`。
+- dsh 每次运行都会生成新的 access token 和 cookie secret，但 Caddy 会在内部换成新 token；**你的 URL 和密码不变**，不需要每次重新复制长 URL。
 - 页面填写的凭据和会话投影缓存会跨运行保留；如果更希望 key 只存在于 secret 中，设置 `DSH_PERSIST_CREDENTIALS=false` 并配置 `DEEPSEEK_API_KEY`。
 
 ### 停止
@@ -296,7 +309,7 @@ gh workflow run dsh-stop.yml --repo "$REPO"
 停止工作流会把私有状态仓库的 `DSH_STOP` 变量设为当前 run id。supervisor 每 10 秒检查一次，收到后：
 
 1. 向 dsh 发送 SIGTERM，最多等待 120 秒，必要时 SIGKILL。
-2. 停止 cloudflared，清理临时文件（不碰 `DSH_HOME/spill`）。
+2. 停止 cloudflared 和 Caddy，清理临时文件（不碰 `DSH_HOME/spill`）。
 3. 执行 `state.sh save --final`，然后释放 `runtime/lock.json`。
 4. 如果 540 秒内没退出，dsh-stop 兜底调用 `gh run cancel`。
 
@@ -385,32 +398,40 @@ DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工
 
 ## 8. 安全
 
-- **公共仓库零秘密**：不提交 token、URL、状态、日志或截图；公开 summary 只说明 URL 位于私有 `runtime/url.txt`，绝不打印 URL。
-- **状态仓库必须 private**：`state.sh init` 会检查仓库可见性，公开则拒绝启动。`runtime/url.txt` 里的 URL 本身就是访问凭据；`.credentials.yaml` 和冷会话归档也在这个仓库中。
+- **公共仓库零秘密**：不提交 token、状态、日志或截图；公开 summary 不打印任何凭据。
+- **状态仓库必须 private**：`state.sh init` 会检查仓库可见性，公开则拒绝启动。`.credentials.yaml` 和冷会话归档在这个仓库中；`runtime/url.txt` 现在只是固定的公开 URL，不再包含 access token。
 - **PAT 最小权限**：fine-grained、只对 `dsh-web-state` 开放 Contents + Variables，90 天过期并定期轮换。过期是初始化失败最常见的原因之一。`SESSION_ARCHIVE_TOKEN` 只需要 Contents: Read，可单独创建一个只读 token 给 session archive agent；不设置时回退到 `STATE_REPO_TOKEN`。
 - **明文凭据的边界**：`DSH_PERSIST_CREDENTIALS=true` 时模型 key 明文存在于私有 release 快照和 `state` 分支；能读状态仓库的人或 token 就能读 key。怀疑泄露时轮换 key、PAT 和 tunnel token。
-- **Cloudflare Access**：建议开启，给 hostname 套一层邮箱验证码/allow list；URL 泄露时仍有第二道门。
-- **仓库/隧道/归档令牌不进入 dsh 或 cloudflared**：dsh 只保留模型 key（`DEEPSEEK_API_KEY`，并映射为 `DEEP_API_KEY` 供自定义 provider 使用）；`STATE_REPO_TOKEN`、`SESSION_ARCHIVE_TOKEN`、`CF_TUNNEL_TOKEN`、`DSH_NOTIFY_WEBHOOK`、`GH_TOKEN`、`GITHUB_TOKEN` 会被 `env -u` 剥离。cloudflared 只拿到 `TUNNEL_TOKEN`；归档 token 只在 agent 进程里。
-- **不打印、不进 argv、不进公开 summary**：git 认证走 `GIT_ASKPASS`，token 不拼进 git remote URL；访问 URL 由 supervisor 写入 `$RUN_DIR/url.txt`（0600），`state.sh publish-url` 从文件读取，不作为命令行参数；脚本使用 `umask 077`，日志 0600，禁用 `set -x`。注意：dsh 自身会把带令牌的 URL 打印到 `$DSH_LOG`，该文件仅存在于 runner 本地 scratch（0600），不会上传，也不写入 job summary。`DSH_DEBUG_LOG_TAIL=true` 只用于启动失败诊断，默认关闭，输出时会遮蔽 URL。
-- **无 artifacts**：工作流不上传任何 artifact，避免 URL/令牌随构建产物泄露。
+- **网页密码**：`DSH_WEB_PASSWORD` 只存在 GitHub secret 和 runner 的 `Caddyfile`（0600）；Caddy 的 bcrypt hash 在 `$RUN_DIR/Caddyfile`，dsh access token 也在同一个 0600 文件里。两者都不进状态快照、不进公开日志。
+- **Cloudflare Access**：建议开启，给 hostname 再套一层邮箱验证码/allow list；Caddy 密码之外还有第二道门。
+- **仓库/隧道/归档令牌不进入 dsh 或 cloudflared**：dsh 只保留模型 key（`DEEPSEEK_API_KEY`，并映射为 `DEEP_API_KEY` 供自定义 provider 使用）；`STATE_REPO_TOKEN`、`SESSION_ARCHIVE_TOKEN`、`CF_TUNNEL_TOKEN`、`DSH_WEB_PASSWORD`、`DSH_NOTIFY_WEBHOOK`、`GH_TOKEN`、`GITHUB_TOKEN` 会被 `env -u` 剥离。cloudflared 只拿到 `TUNNEL_TOKEN`；归档 token 只在 agent 进程里。
+- **不打印、不进 argv、不进公开 summary**：git 认证走 `GIT_ASKPASS`，token 不拼进 git remote URL；Caddyfile 由脚本写入 0600 文件，密码通过 stdin 交给 `caddy hash-password`，不进入 argv；脚本使用 `umask 077`，日志 0600，禁用 `set -x`。dsh 自身会把带 token 的 URL 打印到 `$DSH_LOG`，该文件仅存在于 runner 本地 scratch（0600），不会上传，也不写入 job summary。`DSH_DEBUG_LOG_TAIL=true` 只用于启动失败诊断，默认关闭，输出时会遮蔽 URL。
+- **无 artifacts**：工作流不上传任何 artifact，避免日志/凭据随构建产物泄露。
 - **上传前扫描**：快照在保存前用 gitleaks 扫描；命中会阻止保存并停止本次运行（exit 5），请先清理状态中的密钥。唯一例外是 `DSH_PERSIST_CREDENTIALS=true` 时的 `$DSH_HOME/.credentials.yaml`；冷会话日志仍按默认规则扫描，归档上传发生在这轮扫描之后。
-- **轮换/应急**：怀疑泄露时，先运行 dsh-stop；随后吊销 PAT、刷新 Cloudflare tunnel token、必要时删除私有 release assets 和 `state` 分支中的 URL 文件。
+- **轮换/应急**：怀疑泄露时，先运行 dsh-stop；随后轮换 `DSH_WEB_PASSWORD`、吊销 PAT、刷新 Cloudflare tunnel token，必要时删除私有 release assets。
 
 ## 9. 故障排查
 
 ### 403 / Invalid Host header / trusted-host
 
 - `DSH_PUBLIC_HOST` 必须与浏览器地址栏的主机名完全一致：只写 `dsh.example.com`，不要 `https://`、路径、端口或结尾斜杠。
-- Cloudflare Public Hostname 必须指向同一个主机名，Service 必须是 `http://127.0.0.1:3080`。
+- Cloudflare Public Hostname 必须指向同一个主机名，Service 必须是 `http://127.0.0.1:3080`（Caddy 入口）。
 - 改完变量后重新运行工作流；运行中的进程不会热更新该值。
 - 使用 Access 时确认请求已通过 Access 登录，服务令牌配置正确。
+
+### 401 / 密码错误 / 不弹登录框
+
+- 浏览器应弹出 basic auth；用户名默认 `dsh`，密码是 `DSH_WEB_PASSWORD` secret。改密码后必须重新运行工作流，Caddy 才会重新生成 hash。
+- 如果一直 401，检查 secret 是否有多余换行，或 `DSH_WEB_USER` 是否被改过。
+- 如果连密码框都不弹，说明请求没到 Caddy：检查隧道 origin 是否仍指向 `127.0.0.1:3080`，以及 `caddy.log` 是否在监听。
+- Caddy 不可用时 cloudflared 会返回 502；Caddy 进程异常退出会让本次运行停止（`caddy-exited`）。
 
 ### Cloudflare 1033 / 502 / 530
 
 - **1033**：隧道没有连上。检查 `CF_TUNNEL_TOKEN` 是否有效、是否被刷新过、cloudflared 是否在启动日志里报错；必要时在控制台重新生成 token。
-- **502**：cloudflared 已连上，但本地 3080 没有服务。通常是 dsh 还在启动或已崩溃；等待 2–5 分钟，仍失败则看 dsh 日志和 trusted-host 配置。
+- **502**：cloudflared 已连上，但本地 3080 的 Caddy 没有服务。通常是 dsh/Caddy 还在启动或已崩溃；等待 2–5 分钟，仍失败则看 `dsh-web.log`、`caddy.log` 和 trusted-host 配置。
 - **530**：Public Hostname 路由缺失或 DNS 未生效；确认 hostname 绑定在正确的隧道上。
-- URL 刚重启后短暂 502/1033 是正常的，等新的 `runtime/url.txt` 出现后再打开。
+- 刚重启后短暂 502/1033 是正常的，等本次运行日志出现 `caddy auth proxy is ready` 再打开。
 
 ### 磁盘不足 / job 被终止
 
@@ -454,7 +475,7 @@ DSH 的文件工作区只有 `/home/runner/work1` 会被快照保存。新增工
 - 确认 `state` 分支和 `dsh-state` release 存在（3.2、3.3）。
 - 确认 PAT 未过期、仍有 Contents + Variables 权限，且只授权了 `dsh-web-state`。
 - 确认私有仓库没有被误设为 public；`init` 会直接拒绝。
-- `runtime/url.txt` 只在 dsh 成功启动并解析出 URL 后写入，dsh 启动失败时不会出现。
+- `runtime/url.txt` 只在 dsh 启动、Caddy 就绪后写入固定公开 URL；dsh 或 Caddy 启动失败时不会出现。
 
 ### 状态锁 / 并发
 
@@ -492,7 +513,7 @@ Remove-Item -Recurse -Force F:\dsh-temp
 ├── dsh-actions/
 │   ├── state.sh                    # 状态初始化、发布 URL、保存/恢复、锁、冷归档
 │   ├── sync-excludes.txt           # home/work 的共同排除规则
-│   ├── run.sh                      # cloudflared + dsh + archive agent supervisor
+│   ├── run.sh                      # cloudflared + Caddy + dsh + archive agent supervisor
 │   ├── session-archive-agent.mjs   # 冷会话下载/校验/恢复 agent
 │   ├── tests/                      # 归档和 agent 测试
 │   └── README.md                   # 维护者接口与运维细节
