@@ -22,9 +22,6 @@ die() { log "error: $*"; exit 1; }
 : "${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN must be set}"
 : "${DSH_WEB_PASSWORD:?DSH_WEB_PASSWORD must be set}"
 
-DSH_WEB_USER="${DSH_WEB_USER:-dsh}"
-[[ "$DSH_WEB_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "DSH_WEB_USER contains unsupported characters"
-
 DSH_PUBLIC_HOST="${DSH_PUBLIC_HOST%/}"
 [[ -n "$DSH_PUBLIC_HOST" ]] || die "DSH_PUBLIC_HOST is empty"
 [[ "$DSH_PUBLIC_HOST" != *"://"* && "$DSH_PUBLIC_HOST" != */* ]] \
@@ -74,11 +71,10 @@ readonly URL_FILE="$RUN_DIR/url.txt"
 readonly AUTO_RESTART_LOG="$RUN_DIR/auto-restart.log"
 readonly ARCHIVE_LOG="$RUN_DIR/session-archive.log"
 readonly ARCHIVE_SOCKET="$RUN_DIR/session-archive.sock"
-readonly CADDY_LOG="$RUN_DIR/caddy.log"
-readonly CADDYFILE="$RUN_DIR/Caddyfile"
 
 readonly DSH_PORT=3081
-readonly CADDY_PORT=3080
+readonly POCKET_PORT=3080
+readonly POCKET_HOME="$DSH_HOME/dsh-pocket"
 
 STARTED_AT="$(date +%s)"
 DEADLINE_EPOCH=$(( STARTED_AT + MAX_RUNTIME_MIN * 60 ))
@@ -92,12 +88,10 @@ CLEANUP_DONE=0
 
 DSH_PID=""
 CFD_PID=""
-CADDY_PID=""
 ARCHIVE_PID=""
 ARCHIVE_READY=false
 ARCHIVE_OVERLAY=""
 DSH_URL=""
-DSH_TOKEN=""
 
 CHECKPOINT_EVERY_MIN="$CHECKPOINT_BASE_MIN"
 CHECKPOINT_COUNT=0
@@ -351,7 +345,7 @@ restore_profile_plugins() {
   (( deps > 0 )) || return 0
   log "reinstalling ${deps} profile plugin dependencies"
   if env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
-         -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK \
+         -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK -u DSH_WEB_PASSWORD \
          timeout 900 dsh plugin --profile web install >>"$DSH_LOG" 2>&1; then
     log "profile plugins reinstalled"
   else
@@ -360,6 +354,39 @@ restore_profile_plugins() {
   if [ -e "$DSH_HOME/profiles/web/node_modules/@dsh-web/session-archive" ]; then
     ARCHIVE_READY=true
   fi
+}
+
+ensure_pocket_plugin() {
+  local pkg="$DSH_HOME/profiles/web/package.json"
+  [ -f "$pkg" ] || { warn "profile package.json not found; dsh-pocket not installed"; return 0; }
+  command -v jq >/dev/null 2>&1 || { warn "jq is not available; cannot inspect the profile"; return 0; }
+  if jq -e '.dependencies["dsh-pocket"] // empty' "$pkg" >/dev/null 2>&1; then
+    log "dsh-pocket is already in profile web"
+    return 0
+  fi
+  command -v pnpm >/dev/null 2>&1 || { warn "pnpm is not installed; cannot add dsh-pocket"; return 0; }
+  log "adding dsh-pocket to profile web"
+  if env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+         -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK -u DSH_WEB_PASSWORD \
+         timeout 300 dsh plugin --profile web add dsh-pocket -w >>"$DSH_LOG" 2>&1; then
+    log "dsh-pocket added to profile web"
+  else
+    warn "could not add dsh-pocket; public password proxy will be unavailable"
+  fi
+}
+
+prepare_pocket_settings() {
+  local token="${DSH_WEB_PASSWORD:-}"
+  [[ "$token" =~ ^[A-Za-z0-9]{8,64}$ ]] \
+    || { warn "DSH_WEB_PASSWORD must be 8-64 letters/digits for dsh-pocket"; return 1; }
+  mkdir -p -- "$POCKET_HOME"
+  chmod 700 -- "$POCKET_HOME" 2>/dev/null || true
+  printf '%s\n' "$token" > "$POCKET_HOME/token"
+  chmod 600 -- "$POCKET_HOME/token" 2>/dev/null || true
+  printf '%s\n' '{"proxyPort":3080,"publicPinCustom":true,"lanEnabled":false,"lanAuthEnabled":true}' \
+    > "$POCKET_HOME/settings.json"
+  chmod 600 -- "$POCKET_HOME/settings.json" 2>/dev/null || true
+  log "dsh-pocket settings prepared; password proxy will listen on 127.0.0.1:$POCKET_PORT"
 }
 
 ensure_session_archive_plugin() {
@@ -379,6 +406,7 @@ ensure_session_archive_plugin() {
     log "adding the session archive plugin to profile web"
     if env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
            -u DEEPSEEK_API_KEY -u DEEP_API_KEY -u DSH_NOTIFY_WEBHOOK -u SESSION_ARCHIVE_TOKEN \
+           -u DSH_WEB_PASSWORD \
            timeout 300 dsh plugin --profile web add "file:$plugin_dir" >>"$DSH_LOG" 2>&1; then
       log "session archive plugin added to profile web"
     else
@@ -453,76 +481,11 @@ start_dsh() {
   (
     cd -- "$DSH_WORKSPACE"
     exec env -u STATE_REPO_TOKEN -u CF_TUNNEL_TOKEN -u GH_TOKEN -u GITHUB_TOKEN -u DSH_NOTIFY_WEBHOOK \
-      -u SESSION_ARCHIVE_TOKEN \
+      -u SESSION_ARCHIVE_TOKEN -u DSH_WEB_PASSWORD \
       DSH_SESSION_ARCHIVE_SOCKET="$ARCHIVE_SOCKET" \
       "${dsh_args[@]}"
   ) >>"$DSH_LOG" 2>&1 &
   DSH_PID=$!
-}
-
-dsh_url_token() {
-  local url="${1:-}" query part
-  local -a parts=()
-  [[ "$url" == *\?* ]] || return 1
-  query="${url#*\?}"
-  IFS='&' read -r -a parts <<< "$query"
-  for part in "${parts[@]}"; do
-    if [[ "$part" == token=* ]]; then
-      printf '%s' "${part#token=}"
-      return 0
-    fi
-  done
-  return 1
-}
-
-start_caddy() {
-  local token hash="" waited=0
-  command -v caddy >/dev/null 2>&1 || { warn "caddy is not on PATH"; return 1; }
-  command -v curl >/dev/null 2>&1 || { warn "curl is not on PATH"; return 1; }
-  token="$(dsh_url_token "$DSH_URL")" || { warn "could not extract the dsh access token"; return 1; }
-  [[ -n "$token" ]] || { warn "the dsh access token is empty"; return 1; }
-  [[ "$token" != *[[:space:]]* && "$token" != *'"'* && "$token" != *'{'* && "$token" != *'}'* ]] \
-    || { warn "the dsh access token contains unsupported characters"; return 1; }
-  [[ "$token" != *'&'* && "$token" != *'#'* && "$token" != *'%'* && "$token" != *'?'* ]] \
-    || { warn "the dsh access token contains query-unsafe characters"; return 1; }
-  local marker
-  marker="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
-  [[ -n "$marker" ]] || { warn "could not derive the caddy marker"; return 1; }
-  hash="$(printf '%s' "$DSH_WEB_PASSWORD" | caddy hash-password 2>/dev/null)" \
-    || { warn "could not hash DSH_WEB_PASSWORD"; return 1; }
-  [[ "$hash" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] \
-    || { warn "unexpected caddy password hash format"; return 1; }
-
-  : > "$CADDY_LOG"
-  chmod 600 -- "$CADDY_LOG" 2>/dev/null || true
-  printf '{\n\tadmin off\n}\n\n:%s {\n\tbasic_auth {\n\t\t%s %s\n\t}\n\t@needs_token not header_regexp Cookie "dsh-caddy=%s"\n\turi @needs_token query token %s\n\theader @needs_token +Set-Cookie "dsh-caddy=%s; Path=/; HttpOnly; SameSite=Strict; Secure"\n\t@has_marker header_regexp Cookie "dsh-caddy=%s"\n\turi @has_marker query -token\n\treverse_proxy 127.0.0.1:%s {\n\t\tflush_interval -1\n\t}\n}\n' \
-    "$CADDY_PORT" "$DSH_WEB_USER" "$hash" "$marker" "$token" "$marker" "$marker" "$DSH_PORT" > "$CADDYFILE"
-  chmod 600 -- "$CADDYFILE" 2>/dev/null || true
-
-  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >>"$CADDY_LOG" 2>&1; then
-    warn "caddy rejected the generated Caddyfile; see $CADDY_LOG"
-    return 1
-  fi
-
-  log "starting caddy auth proxy on 127.0.0.1:$CADDY_PORT"
-  caddy run --config "$CADDYFILE" --adapter caddyfile >>"$CADDY_LOG" 2>&1 &
-  CADDY_PID=$!
-  while (( waited < 40 )); do
-    if ! process_alive "$CADDY_PID"; then
-      warn "caddy exited during startup; see $CADDY_LOG"
-      CADDY_PID=""
-      return 1
-    fi
-    if curl -fsS --max-time 2 -u "$DSH_WEB_USER:$DSH_WEB_PASSWORD" \
-         "http://127.0.0.1:$CADDY_PORT/" >/dev/null 2>&1; then
-      log "caddy auth proxy is ready"
-      return 0
-    fi
-    sleep 0.5 || true
-    waited=$(( waited + 1 ))
-  done
-  warn "caddy did not become ready; see $CADDY_LOG"
-  return 1
 }
 
 checkpoint() {
@@ -622,14 +585,6 @@ run_loop() {
       CFD_PID=""
       warn "cloudflared exited unexpectedly (rc=$rc); see $CFD_LOG"
       STOP_REASON="cloudflared-exited"
-      EXIT_CODE=1
-      return 0
-    fi
-    if ! process_alive "$CADDY_PID"; then
-      wait "$CADDY_PID" 2>/dev/null || rc=$?
-      CADDY_PID=""
-      warn "caddy exited unexpectedly (rc=$rc); see $CADDY_LOG"
-      STOP_REASON="caddy-exited"
       EXIT_CODE=1
       return 0
     fi
@@ -743,8 +698,6 @@ cleanup() {
   DSH_PID=""
   terminate_process "${CFD_PID:-}" "$CFD_STOP_GRACE_SEC" "cloudflared"
   CFD_PID=""
-  terminate_process "${CADDY_PID:-}" "$CFD_STOP_GRACE_SEC" "caddy"
-  CADDY_PID=""
   cleanup_tmp_scratch
   if [[ -f "$STATE_SH" ]]; then
     log "final state save"
@@ -804,8 +757,7 @@ main() {
   : > "$STATE_LOG"
   : > "$AUTO_RESTART_LOG"
   : > "$ARCHIVE_LOG"
-  : > "$CADDY_LOG"
-  chmod 600 -- "$DSH_LOG" "$CFD_LOG" "$STATE_LOG" "$AUTO_RESTART_LOG" "$ARCHIVE_LOG" "$CADDY_LOG" 2>/dev/null || true
+  chmod 600 -- "$DSH_LOG" "$CFD_LOG" "$STATE_LOG" "$AUTO_RESTART_LOG" "$ARCHIVE_LOG" 2>/dev/null || true
 
   if [[ -z "${TMPDIR:-}" ]]; then
     TMPDIR="$DSH_SCRATCH/dsh-tmp"
@@ -820,6 +772,8 @@ main() {
   prune_stale_tmp
   ensure_session_archive_plugin
   restore_profile_plugins
+  ensure_pocket_plugin
+  prepare_pocket_settings || { STOP_REASON="pocket-config"; EXIT_CODE=1; return 0; }
   install_session_archive_overlay
   if [ "$ARCHIVE_READY" != true ] || [ -z "$ARCHIVE_OVERLAY" ] || [ ! -f "$ARCHIVE_OVERLAY" ]; then
     export SESSION_ARCHIVE_ENABLED=false
@@ -846,22 +800,12 @@ main() {
     EXIT_CODE=1
     return 0
   fi
-  DSH_TOKEN="$(dsh_url_token "$DSH_URL")" || {
-    STOP_REASON="startup-failed"
-    EXIT_CODE=1
-    return 0
-  }
-  if ! start_caddy; then
-    STOP_REASON="caddy-startup"
-    EXIT_CODE=1
-    return 0
-  fi
   if ! publish_url "https://$DSH_PUBLIC_HOST/"; then
     STOP_REASON="publish-failed"
     EXIT_CODE=1
     return 0
   fi
-  log "dsh web is up behind caddy; supervisor loop started"
+  log "dsh web is up behind dsh-pocket; supervisor loop started"
   run_loop
 }
 
